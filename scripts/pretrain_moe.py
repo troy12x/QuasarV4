@@ -4,7 +4,7 @@ import torch
 import os
 import argparse
 from datetime import datetime
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 import wandb
@@ -57,7 +57,9 @@ def main(args):
     
     # Add a pad token if one doesn't exist. This is required for batched training.
     if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        # If no pad token exists, use the EOS token for padding.
+        # This is a common practice for autoregressive models.
+        tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 
     # --- 3. Load and Prepare Dataset ---
@@ -71,32 +73,34 @@ def main(args):
 
     tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
     tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
-    train_dataloader = DataLoader(tokenized_dataset, batch_size=args.batch_size, shuffle=True)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    train_dataloader = DataLoader(tokenized_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
 
     # --- 4. Initialize Quasar MoE Model using QuasarConfig ---
     if accelerator.is_main_process:
         print("Initializing QuasarV4 with MoE architecture...")
 
     # Create a config object from arguments
-    config = QuasarConfig(
+    model_config = QuasarConfig(
         vocab_size=vocab_size,
         embedding_dim=args.embedding_dim,
-        hidden_dim=args.hidden_dim,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
         num_experts=args.num_experts,
         expert_dim=args.expert_dim,
-        top_k=args.top_k,
+        top_k=args.top_k
     )
 
     with init_empty_weights():
         # Create a meta model for fast parameter counting
-        meta_model = Quasar(config)
+        meta_model = Quasar(model_config)
 
     # Print parameter counts based on meta model (fast, no memory overhead)
     if accelerator.is_main_process:
         print_model_parameters(meta_model)
 
     # Instantiate the real model on CPU (or default device) for training
-    model = Quasar(config)
+    model = Quasar(model_config)
 
     # Manually enable gradient checkpointing. This is a workaround for a library issue
     # where our model's declared support for this feature is not being recognized.
@@ -148,33 +152,30 @@ def main(args):
     vocab_size = tokenizer.vocab_size
 
     # --- 7. Training Loop ---
-    criterion = torch.nn.CrossEntropyLoss()
     total_steps = len(train_dataloader) * args.num_epochs
     progress_bar = tqdm(range(total_steps), disable=not accelerator.is_main_process)
 
     for epoch in range(args.num_epochs):
         model.train()
-        for step, batch in enumerate(train_dataloader):
-            inputs = batch['input_ids'][:, :-1]
-            targets = batch['input_ids'][:, 1:]
+        for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
+            # The DataCollatorForLanguageModeling automatically creates the 'labels' field.
+            # The model's forward pass accepts all items in the batch dictionary.
+            outputs = model(**batch)
 
-            optimizer.zero_grad()
+            # Extract losses from the model output
+            total_loss = outputs['loss']
+            load_balancing_loss = outputs['lb_loss']
             
-            logits, load_balancing_loss = model(inputs)
-            
-            # Main language modeling loss (use logits.size(-1) to align with actual vocab dimension)
-            main_loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-            
-            # Total loss with MoE load balancing
-            total_loss = main_loss + args.lb_lambda * load_balancing_loss
-            
+            # For logging, we can derive the main cross-entropy loss
+            main_loss = total_loss - load_balancing_loss
+
             accelerator.backward(total_loss)
-
-            # Clip gradients to prevent explosion
-            if accelerator.sync_gradients:
+            
+            if args.max_grad_norm > 0:
                 accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
+            
             optimizer.step()
+            optimizer.zero_grad()
             progress_bar.update(1)
 
             # Save checkpoint at step 1 and push to Hub
@@ -243,7 +244,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Pre-train QuasarV4 MoE Model")
     # Model Args (400B Configuration)
     parser.add_argument('--embedding_dim', type=int, default=8192, help='Embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=8192, help='Hidden dimension')
+    parser.add_argument('--num_hidden_layers', type=int, default=96, help='Number of hidden layers')
+    parser.add_argument('--num_attention_heads', type=int, default=64, help='Number of attention heads')
     parser.add_argument('--num_experts', type=int, default=128, help='Number of experts')
     parser.add_argument('--expert_dim', type=int, default=2048, help='Expert dimension')
     parser.add_argument('--top_k', type=int, default=4, help='Top-k routing for MoE')
@@ -260,7 +262,7 @@ if __name__ == '__main__':
     parser.add_argument('--tokenizer_path', type=str, default='deepseek-ai/DeepSeek-V3-0324', help='Path or Hub ID for tokenizer')
     parser.add_argument("--dataset_name", type=str, default="SharedBailii/bailii-pretraining-order", help="Name of the dataset to use.")
     parser.add_argument('--hf_repo', type=str, default='silx-ai/QuasarV4-400B-1M', help='Hugging Face Hub repo')
-    parser.add_argument('--hf_token', type=str, default='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', help='Hugging Face Hub token')
+    parser.add_argument('--hf_token', type=str, default='', help='Hugging Face Hub token')
     # W&B Args
     parser.add_argument('--wandb_project', type=str, default='quasar-400b-pretraining', help='W&B project name')
     parser.add_argument('--wandb_run_name', type=str, default=f'run-{datetime.now().strftime("%Y%m%d-%H%M%S")}', help='W&B run name')

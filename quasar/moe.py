@@ -39,9 +39,8 @@ class MoELayer(nn.Module):
         self.router = MoERouter(embedding_dim, num_experts, top_k)
         self.num_experts = num_experts
 
-        # Create experts with a progress bar for monitoring
-        print(f"\nInitializing {self.num_experts} experts of size {expert_dim}...")
-        experts = [Expert(embedding_dim, expert_dim) for _ in tqdm(range(self.num_experts), desc="Creating MoE Experts")]
+        # Create experts
+        experts = [Expert(embedding_dim, expert_dim) for _ in range(self.num_experts)]
         self.experts = nn.ModuleList(experts)
 
     def forward(self, x):
