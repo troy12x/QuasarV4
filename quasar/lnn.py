@@ -16,11 +16,12 @@ class LNNCell(nn.Module):
         self.input_size = input_size
         self.lambda_res = lambda_res
 
-        # Learnable parameters
-        self.alpha = nn.Parameter(torch.rand(hidden_size))          # Time constants per neuron
-        self.W = nn.Parameter(torch.randn(hidden_size, hidden_size)) # Recurrent weights
-        self.U = nn.Parameter(torch.randn(hidden_size, input_size))  # Input weights
-        self.b = nn.Parameter(torch.zeros(hidden_size))              # Bias
+        # Learnable parameters are created with torch.empty to be compatible with `init_empty_weights`.
+        # The `accelerate` framework will handle the actual initialization.
+        self.alpha = nn.Parameter(torch.empty(hidden_size))          # Time constants per neuron
+        self.W = nn.Parameter(torch.empty(hidden_size, hidden_size)) # Recurrent weights
+        self.U = nn.Parameter(torch.empty(hidden_size, input_size))  # Input weights
+        self.b = nn.Parameter(torch.empty(hidden_size))              # Bias
 
         # Activation function
         if activation == 'tanh':
@@ -40,11 +41,6 @@ class LNNCell(nn.Module):
         # directly possible if input_size == hidden_size. If not, a projection
         # layer would be required. We will proceed assuming this condition holds
         # when lambda_res > 0.
-        if self.lambda_res > 0 and self.input_size != self.hidden_size:
-            print(f"Warning: LNN residual connection (lambda_res > 0) "
-                  f"requires input_size ({self.input_size}) == hidden_size ({self.hidden_size}). "
-                  f"Residual connection will be disabled.")
-            self.lambda_res = 0.0
 
 
     def forward(self, t, x, u):
@@ -65,7 +61,8 @@ class LNNCell(nn.Module):
         )
 
         # Add residual connection from the input
-        if self.lambda_res > 0:
+        # Add residual connection only if dimensions match
+        if self.lambda_res > 0 and x.shape[-1] == u.shape[-1]:
             dx_dt = dx_dt + self.lambda_res * u
 
         return dx_dt
@@ -80,6 +77,8 @@ class LNN(nn.Module):
         self.hidden_size = hidden_size
         self.cell = LNNCell(input_size, hidden_size, **kwargs)
 
+
+
     def forward(self, u, h0=None):
         """
         Processes a sequence of inputs through the LNN.
@@ -92,25 +91,23 @@ class LNN(nn.Module):
             torch.Tensor: Output sequence of hidden states of shape (seq_len, batch_size, hidden_size).
         """
         seq_len, batch_size, _ = u.shape
+
+        # Meta device guard for `torchdiffeq.odeint` compatibility.
+        if u.device.type == 'meta':
+            return torch.zeros(seq_len, batch_size, self.hidden_size, device='meta')
+
         if h0 is None:
-            h0 = torch.zeros(batch_size, self.hidden_size, device=u.device)
+            h0 = torch.zeros(batch_size, self.hidden_size, device=self.cell.b.device)
+
+        # Create t_span on the correct device, right before it's needed.
+        t_span = torch.tensor([0.0, 1.0], device=h0.device)
 
         outputs = []
         h = h0
 
-        # Process each token in the sequence
         for i in range(seq_len):
-            # Define the ODE for the current input token u_i.
-            # The input u[i] is held constant over the integration interval [0, 1].
             ode_func = lambda t, x: self.cell(t, x, u[i])
-            
-            # Integrate over a time interval [0, 1] for each step.
-            t_span = torch.tensor([0.0, 1.0], device=u.device)
-            
-            # Solve the ODE using an adaptive solver (e.g., 'dopri5') or a fixed-step one ('rk4').
-            # odeint returns a tensor of shape (time_points, batch_size, hidden_size).
-            h_next = odeint(ode_func, h, t_span, method='rk4')[1] # We only need the final state at t=1.
-            
+            h_next = odeint(ode_func, h, t_span, method='rk4')[1]
             outputs.append(h_next)
             h = h_next
 

@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 class Expert(nn.Module):
     """An expert network. For Quasar, this could be an LNN layer followed by a feed-forward network."""
@@ -25,75 +26,64 @@ class MoERouter(nn.Module):
         self.gate = nn.Linear(embedding_dim, num_experts)
 
     def forward(self, x):
-        # x: [batch_size, seq_len, embedding_dim]
-        # gate_logits: [batch_size * seq_len, num_experts]
-        gate_logits = self.gate(x.view(-1, x.shape[-1]))
-        
-        # Find top-k experts for each token
-        # top_k_weights: [batch_size * seq_len, top_k]
-        # top_k_indices: [batch_size * seq_len, top_k]
-        top_k_weights, top_k_indices = torch.topk(gate_logits, self.top_k, dim=-1)
-        
-        # Apply softmax to get normalized weights
-        top_k_weights = F.softmax(top_k_weights, dim=-1, dtype=torch.float).to(x.dtype)
-        
-        # Create a sparse routing matrix for combining expert outputs
-        # routing_weights: [batch_size * seq_len, num_experts]
-        routing_weights = torch.zeros_like(gate_logits, dtype=x.dtype)
-        routing_weights.scatter_(1, top_k_indices, top_k_weights)
-        
-        return routing_weights, top_k_indices
+        """ Returns the top-k weights and indices for each token. """
+        gate_logits = self.gate(x.reshape(-1, x.shape[-1]))
+        top_k_logits, top_k_indices = torch.topk(gate_logits, self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_logits, dim=-1, dtype=torch.float).to(x.dtype)
+        return top_k_weights, top_k_indices
 
 class MoELayer(nn.Module):
     """A Mixture of Experts layer."""
     def __init__(self, embedding_dim, num_experts, expert_dim, top_k=2):
         super().__init__()
         self.router = MoERouter(embedding_dim, num_experts, top_k)
-        self.experts = nn.ModuleList([Expert(embedding_dim, expert_dim) for _ in range(num_experts)])
         self.num_experts = num_experts
 
+        # Create experts with a progress bar for monitoring
+        print(f"\nInitializing {self.num_experts} experts of size {expert_dim}...")
+        experts = [Expert(embedding_dim, expert_dim) for _ in tqdm(range(self.num_experts), desc="Creating MoE Experts")]
+        self.experts = nn.ModuleList(experts)
+
     def forward(self, x):
-        # Get routing decisions
-        routing_weights, top_k_indices = self.router(x)
-        
-        # Flatten input for expert processing
-        flat_x = x.view(-1, x.shape[-1])
-        
-        # Initialize final output tensor
-        final_output = torch.zeros_like(flat_x)
-        
-        # Loop through each expert
-        for i, expert in enumerate(self.experts):
+        """Forward pass for the MoE layer."""
+        original_shape = x.shape
+        flat_x = x.reshape(-1, x.shape[-1])
+
+        # Create the final output tensor on the correct device, avoiding meta-device issues.
+        final_output = torch.zeros(flat_x.shape, dtype=x.dtype, device=self.router.gate.weight.device)
+
+        # Get routing decisions from the router
+        top_k_weights, top_k_indices = self.router(x)
+
+        # Calculate load balancing loss using one_hot to be meta-tensor compatible
+        num_tokens = top_k_indices.size(0)
+        one_hot_indices = F.one_hot(top_k_indices, num_classes=self.num_experts).float()
+        tokens_per_expert = one_hot_indices.sum(dim=[0, 1])
+        router_probs_per_expert = torch.mean(F.softmax(self.router.gate.weight, dim=0), dim=1)
+        load_balancing_loss = self.num_experts * torch.dot(tokens_per_expert / num_tokens, router_probs_per_expert)
+
+        # Dispatch tokens to experts and aggregate outputs
+        for i in range(self.num_experts):
             # Find which tokens are routed to this expert
-            expert_mask = (top_k_indices == i).any(dim=-1)
-            expert_indices = torch.where(expert_mask)[0]
-            
-            if expert_indices.numel() > 0:
-                # Select tokens and corresponding weights for this expert
-                expert_inputs = flat_x[expert_indices]
-                expert_routing_weights = routing_weights[expert_indices, i]
-                
-                # Get expert output and apply routing weight
-                expert_output = expert(expert_inputs)
-                weighted_output = expert_output * expert_routing_weights.unsqueeze(1)
-                
-                # Add to final output (scatter_add_ is inplace)
-                final_output.index_add_(0, expert_indices, weighted_output)
+            expert_mask = (top_k_indices == i).any(dim=1)
+            expert_indices_for_expert = torch.where(expert_mask)[0]
 
-        # Reshape to original input shape
-        return final_output.view(x.shape)
+            if expert_indices_for_expert.numel() == 0:
+                continue
 
-    def get_load_balancing_loss(self, routing_weights):
-        """Calculate the load balancing loss."""
-        # routing_weights: [num_tokens, num_experts]
-        num_tokens = routing_weights.shape[0]
-        
-        # Per-expert load: fraction of tokens routed to each expert
-        load = routing_weights.sum(dim=0) / num_tokens
-        
-        # Per-expert importance: mean routing probability to each expert
-        importance = routing_weights.mean(dim=0)
-        
-        # Loss is based on the square of the coefficient of variation
-        loss = self.num_experts * torch.sum(load * importance)
-        return loss
+            # Get the tokens for this expert
+            expert_tokens = flat_x[expert_indices_for_expert]
+
+            # Find the specific weight for this expert for each token
+            top_k_weights_for_expert = top_k_weights[expert_indices_for_expert]
+            is_expert_in_top_k = (top_k_indices[expert_indices_for_expert] == i)
+            weights_for_expert = torch.sum(top_k_weights_for_expert * is_expert_in_top_k, dim=1, keepdim=True)
+
+            # Process with expert and apply routing weight
+            expert_output = self.experts[i](expert_tokens)
+            weighted_output = expert_output * weights_for_expert
+
+            # Add the weighted output to the final output tensor at the correct positions
+            final_output.index_add_(0, expert_indices_for_expert, weighted_output)
+
+        return final_output.reshape(original_shape), load_balancing_loss

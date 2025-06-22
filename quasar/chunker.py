@@ -8,7 +8,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 # Ensure the sentence tokenizer is downloaded
 try:
     nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
+except LookupError:
     print("Downloading 'punkt' model for NLTK sentence tokenization...")
     nltk.download('punkt')
 

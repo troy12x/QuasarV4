@@ -3,10 +3,14 @@
 import torch
 import os
 import argparse
+from datetime import datetime
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-from accelerate import Accelerator
+import wandb
+from accelerate import Accelerator, init_empty_weights, notebook_launcher
+from accelerate.utils import FullyShardedDataParallelPlugin, ProjectConfiguration
+from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
 from huggingface_hub import HfApi, create_repo
 from tqdm import tqdm
 import sys
@@ -14,7 +18,7 @@ import sys
 # Add project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from quasar.model import Quasar
+from quasar.model import Quasar, QuasarConfig
 
 def print_model_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
@@ -32,51 +36,116 @@ def print_model_parameters(model):
     print("-----------------------------\n")
 
 def main(args):
-    # --- 1. Initialize Accelerator for distributed training ---
-    accelerator = Accelerator()
+    # --- 1. Initialize Accelerator ---
+    # --- Setup Accelerator with FSDP for Large Model Training ---
+    # FSDP shards the model and optimizer across GPUs, and CPU Offload uses system RAM
+    # to further reduce GPU memory usage, preventing out-of-memory errors.
+    fsdp_plugin = FullyShardedDataParallelPlugin(cpu_offload=CPUOffload(offload_params=True))
+    project_config = ProjectConfiguration(project_dir="./outputs", logging_dir="./outputs/logs")
+    
+    accelerator = Accelerator(
+        log_with="wandb",
+        mixed_precision="bf16",  # Use bfloat16 for faster training and less memory
+        fsdp_plugin=fsdp_plugin,
+        project_config=project_config
+    )
     device = accelerator.device
 
-    # --- 2. Set up Tokenizer ---
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    # --- 1. Load Tokenizer ---
+    print(f"Loading tokenizer from: {args.tokenizer_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, token=args.hf_token, trust_remote_code=True)
+    
+    # Add a pad token if one doesn't exist. This is required for batched training.
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     vocab_size = len(tokenizer)
 
     # --- 3. Load and Prepare Dataset ---
     if accelerator.is_main_process:
-        print(f"Loading dataset '{args.dataset_name}' with subset '{args.dataset_subset}'...")
-    dataset = load_dataset(args.dataset_name, args.dataset_subset, split='train')
+        print(f"Loading dataset '{args.dataset_name}'...")
+    dataset = load_dataset(args.dataset_name, split='train')
 
     def tokenize_function(examples):
-        return tokenizer(examples['text'], truncation=True, padding='max_length', max_length=args.seq_length)
+        # Pad all sequences to the maximum length to ensure uniform tensor shapes.
+        return tokenizer(examples["text"], truncation=True, padding='max_length', max_length=args.seq_length)
 
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=['text'])
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
     tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
     train_dataloader = DataLoader(tokenized_dataset, batch_size=args.batch_size, shuffle=True)
 
-    # --- 4. Initialize Quasar MoE Model ---
+    # --- 4. Initialize Quasar MoE Model using QuasarConfig ---
     if accelerator.is_main_process:
         print("Initializing QuasarV4 with MoE architecture...")
-    model = Quasar(
+
+    # Create a config object from arguments
+    config = QuasarConfig(
         vocab_size=vocab_size,
         embedding_dim=args.embedding_dim,
         hidden_dim=args.hidden_dim,
         num_experts=args.num_experts,
         expert_dim=args.expert_dim,
-        top_k=args.top_k
+        top_k=args.top_k,
     )
-    model.embedding.weight.data.uniform_(-0.1, 0.1)
 
+    with init_empty_weights():
+        # Create a meta model for fast parameter counting
+        meta_model = Quasar(config)
+
+    # Print parameter counts based on meta model (fast, no memory overhead)
+    if accelerator.is_main_process:
+        print_model_parameters(meta_model)
+
+    # Instantiate the real model on CPU (or default device) for training
+    model = Quasar(config)
+
+    # Manually enable gradient checkpointing. This is a workaround for a library issue
+    # where our model's declared support for this feature is not being recognized.
+    model.gradient_checkpointing = True
+
+    # --- 4. Initialize W&B Tracker ---
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            config=vars(args),
+            init_kwargs={"wandb": {"name": args.wandb_run_name}}
+        )
+
+    # --- 5. Prepare Model, then Set up Optimizer ---
+    # When using `init_empty_weights`, the model must be prepared *before* the optimizer is created.
+    # --- 5. Prepare for Distributed Training ---
+
+    if accelerator.is_main_process:
+        print("--- Checking Model Parameter Devices Before Preparation ---")
+        for name, param in model.named_parameters():
+            print(f"Parameter: {name:<60} Device: {param.device}")
+        for name, buf in model.named_buffers():
+            print(f"Buffer:    {name:<60} Device: {buf.device}")
+        print("-----------------------------------------------------")
+
+    # First, prepare the model. This moves it from the meta device to the target device(s).
+    model = accelerator.prepare(model)
+
+    # Now that the model is on the correct device, we can create the optimizer.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    # Then, prepare the optimizer and dataloader.
+    optimizer, train_dataloader = accelerator.prepare(optimizer, train_dataloader)
+
+    if accelerator.is_main_process:
+        # Print device placement directly to the console
+        print(f"--- Log entry at {datetime.now()} ---")
+        print("--- Checking Model Parameter Devices after preparation ---")
+        for name, param in model.named_parameters():
+            print(f"Parameter: {name:<60} Device: {param.device}")
+        for name, buf in model.named_buffers():
+            print(f"Buffer:    {name:<60} Device: {buf.device}")
+        print("--------------------------------------------------------\n")
+        
     if accelerator.is_main_process:
         print_model_parameters(model)
 
-    # --- 5. Set up Optimizer ---
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-
-    # --- 6. Prepare for Distributed Training with Accelerator ---
-    model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader
-    )
+    # Use tokenizer's vocab size (consistent before/after DDP wrapping)
+    vocab_size = tokenizer.vocab_size
 
     # --- 7. Training Loop ---
     criterion = torch.nn.CrossEntropyLoss()
@@ -93,15 +162,57 @@ def main(args):
             
             logits, load_balancing_loss = model(inputs)
             
-            # Main language modeling loss
-            main_loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
+            # Main language modeling loss (use logits.size(-1) to align with actual vocab dimension)
+            main_loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
             
             # Total loss with MoE load balancing
             total_loss = main_loss + args.lb_lambda * load_balancing_loss
             
             accelerator.backward(total_loss)
+
+            # Clip gradients to prevent explosion
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
             optimizer.step()
             progress_bar.update(1)
+
+            # Save checkpoint at step 1 and push to Hub
+            if step == 1 and accelerator.is_main_process:
+                print("\nSaving checkpoint at step 1...")
+                checkpoint_dir = os.path.join(args.output_dir, "step_1_checkpoint")
+                accelerator.save_state(checkpoint_dir)
+
+                print("Pushing model to Hub...")
+                try:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.save_pretrained(
+                        checkpoint_dir,
+                        state_dict=accelerator.get_state_dict(model),
+                        safe_serialization=True
+                    )
+                    tokenizer.save_pretrained(checkpoint_dir)
+                    
+                    api = HfApi()
+                    api.upload_folder(
+                        folder_path=checkpoint_dir,
+                        repo_id=args.hf_repo,
+                        repo_type="model",
+                        token=args.hf_token,
+                        commit_message="WIP: Add 400B model checkpoint at step 1"
+                    )
+                    print(f"Successfully pushed model to {args.hf_repo}")
+                except Exception as e:
+                    print(f"Error pushing to hub: {e}")
+
+            # Log metrics
+            if step % args.log_interval == 0:
+                accelerator.log({
+                    "train_loss": total_loss.item(),
+                    "main_loss": main_loss.item(),
+                    "load_balancing_loss": load_balancing_loss.item(),
+                    "learning_rate": optimizer.param_groups[0]['lr']
+                }, step=step)
 
             if step % args.log_interval == 0 and accelerator.is_main_process:
                 print(f"Epoch {epoch+1}/{args.num_epochs} | Step {step}/{len(train_dataloader)} | Total Loss: {total_loss.item():.4f} | Main Loss: {main_loss.item():.4f} | LB Loss: {load_balancing_loss.item():.4f}")
@@ -130,25 +241,29 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Pre-train QuasarV4 MoE Model")
-    # Model Args
-    parser.add_argument('--embedding_dim', type=int, default=1024, help='Embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=4096, help='Hidden dimension of LNN')
-    parser.add_argument('--num_experts', type=int, default=64, help='Number of experts in MoE')
-    parser.add_argument('--expert_dim', type=int, default=2048, help='Dimension of each expert')
-    parser.add_argument('--top_k', type=int, default=2, help='Number of activated experts per token')
+    # Model Args (400B Configuration)
+    parser.add_argument('--embedding_dim', type=int, default=8192, help='Embedding dimension')
+    parser.add_argument('--hidden_dim', type=int, default=8192, help='Hidden dimension')
+    parser.add_argument('--num_experts', type=int, default=128, help='Number of experts')
+    parser.add_argument('--expert_dim', type=int, default=2048, help='Expert dimension')
+    parser.add_argument('--top_k', type=int, default=4, help='Top-k routing for MoE')
     # Training Args
     parser.add_argument('--num_epochs', type=int, default=1, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size per GPU')
+    parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
     parser.add_argument('--seq_length', type=int, default=1024, help='Sequence length')
     parser.add_argument('--lb_lambda', type=float, default=0.01, help='Lambda for load balancing loss')
-    parser.add_argument('--log_interval', type=int, default=100, help='Logging interval')
+    parser.add_argument('--log_interval', type=int, default=1, help='Logging interval') # Log every step
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping.')
+    parser.add_argument('--output_dir', type=str, default='./outputs', help='Directory to save checkpoints.')
     # Data and Hub Args
-    parser.add_argument('--tokenizer_path', type=str, default='c:/quasarv4', help='Path to local tokenizer files')
-    parser.add_argument('--dataset_name', type=str, default='HuggingFaceTB/smoltalk', help='Dataset name')
-    parser.add_argument('--dataset_subset', type=str, default='everyday-conversations', help='Dataset subset')
+    parser.add_argument('--tokenizer_path', type=str, default='deepseek-ai/DeepSeek-V3-0324', help='Path or Hub ID for tokenizer')
+    parser.add_argument("--dataset_name", type=str, default="SharedBailii/bailii-pretraining-order", help="Name of the dataset to use.")
     parser.add_argument('--hf_repo', type=str, default='silx-ai/QuasarV4-400B-1M', help='Hugging Face Hub repo')
-    parser.add_argument('--hf_token', type=str, default='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', help='Hugging Face Hub token')
+    parser.add_argument('--hf_token', type=str, default='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', help='Hugging Face Hub token')
+    # W&B Args
+    parser.add_argument('--wandb_project', type=str, default='quasar-400b-pretraining', help='W&B project name')
+    parser.add_argument('--wandb_run_name', type=str, default=f'run-{datetime.now().strftime("%Y%m%d-%H%M%S")}', help='W&B run name')
 
     args = parser.parse_args()
     main(args)

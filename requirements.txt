@@ -1,5 +1,13 @@
-torch
+
 torchdiffeq
 numpy
 scikit-learn
 nltk
+accelerate
+datasets
+transformers
+huggingface_hub
+safetensors
+tqdm
+wandb
+
