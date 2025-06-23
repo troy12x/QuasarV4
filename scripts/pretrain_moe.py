@@ -262,7 +262,7 @@ if __name__ == '__main__':
     parser.add_argument('--tokenizer_path', type=str, default='deepseek-ai/DeepSeek-V3-0324', help='Path or Hub ID for tokenizer')
     parser.add_argument("--dataset_name", type=str, default="SharedBailii/bailii-pretraining-order", help="Name of the dataset to use.")
     parser.add_argument('--hf_repo', type=str, default='silx-ai/QuasarV4-400B-1M', help='Hugging Face Hub repo')
-    parser.add_argument('--hf_token', type=str, default='', help='Hugging Face Hub token')
+    parser.add_argument('--hf_token', type=str, default='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', help='Hugging Face Hub token')
     # W&B Args
     parser.add_argument('--wandb_project', type=str, default='quasar-400b-pretraining', help='W&B project name')
     parser.add_argument('--wandb_run_name', type=str, default=f'run-{datetime.now().strftime("%Y%m%d-%H%M%S")}', help='W&B run name')

@@ -91,11 +91,16 @@ def main():
     print(f"Vocabulary size: {vocab_size}")
 
     # Initialize Models
-    quasar_model = Quasar(
+    config = QuasarConfig(
         vocab_size=vocab_size,
         embedding_dim=EMBEDDING_DIM,
-        hidden_dim=HIDDEN_DIM
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_experts=4,
+        expert_dim=256,
+        top_k=2
     )
+    quasar_model = Quasar(config)
 
     transformer_model = TransformerModel(
         vocab_size=vocab_size,

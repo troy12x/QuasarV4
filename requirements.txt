@@ -13,7 +13,6 @@ accelerate==0.25.0
 datasets==2.15.0
 huggingface-hub==0.19.4
 safetensors==0.4.1
-tokenizers==0.18.0
 
 # Other Key Dependencies
 fsspec==2023.10.0

@@ -74,6 +74,7 @@ class Quasar(PreTrainedModel):
 
     def __init__(self, config: QuasarConfig):
         super().__init__(config)
+        self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim)
         print(f"\nInitializing {config.num_hidden_layers} Quasar layers...")
         self.layers = nn.ModuleList([QuasarBlock(config) for _ in tqdm(range(config.num_hidden_layers), desc="Creating Quasar Layers")])
@@ -83,6 +84,9 @@ class Quasar(PreTrainedModel):
     def forward(self, input_ids, labels=None, **kwargs):
         x = self.embedding(input_ids)
         total_lb_loss = 0.0
+        
+        # Add config to kwargs for gradient checkpointing
+        kwargs['config'] = self.config
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
