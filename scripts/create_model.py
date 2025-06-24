@@ -91,7 +91,7 @@ def main():
     # Tokenizer and Output Args
     parser.add_argument('--tokenizer_path', type=str, default='deepseek-ai/DeepSeek-V3-0324', help='Path or Hub ID for tokenizer')
     parser.add_argument('--output_dir', type=str, default='./model', help='Directory to save the model')
-    parser.add_argument('--hf_token', type=str, default='hf', help='Hugging Face Hub token')
+    parser.add_argument('--hf_token', type=str, default='', help='Hugging Face Hub token')
     
     args = parser.parse_args()
     create_and_save_model(args)
