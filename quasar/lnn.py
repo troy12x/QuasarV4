@@ -2,113 +2,108 @@
 
 import torch
 import torch.nn as nn
-from torchdiffeq import odeint
+from transformers import PreTrainedModel, PretrainedConfig
 
-class LNNCell(nn.Module):
-    """
-    A single Liquid Neural Network cell that defines the continuous-time dynamics
-    based on the equation:
-    dx/dt = -alpha * x + sigma(W*x + U*u + b) + lambda * u
-    """
-    def __init__(self, input_size, hidden_size, activation='tanh', lambda_res=0.1):
-        super().__init__()
+# --- 1. LNN Configuration Class ---
+class LNNConfig(PretrainedConfig):
+    """Configuration class for the LNNModel."""
+    model_type = "lnn"
+
+    def __init__(
+        self,
+        vocab_size=151552,
+        hidden_size=8192,
+        num_hidden_layers=96,
+        activation='gelu',
+        lambda_res=0.1,
+        **kwargs
+    ):
+        self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        self.input_size = input_size
+        self.num_hidden_layers = num_hidden_layers
+        self.activation = activation
         self.lambda_res = lambda_res
+        super().__init__(**kwargs)
 
-        # Learnable parameters are created with torch.empty to be compatible with `init_empty_weights`.
-        # The `accelerate` framework will handle the actual initialization.
-        self.alpha = nn.Parameter(torch.empty(hidden_size))          # Time constants per neuron
-        self.W = nn.Parameter(torch.empty(hidden_size, hidden_size)) # Recurrent weights
-        self.U = nn.Parameter(torch.empty(hidden_size, input_size))  # Input weights
-        self.b = nn.Parameter(torch.empty(hidden_size))              # Bias
+# --- 2. Core LNN Cell (The "Real" Implementation) ---
+class LNNCell(nn.Module):
+    """A single Liquid Neural Network cell with continuous-time dynamics."""
+    def __init__(self, config: LNNConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.lambda_res = config.lambda_res
 
-        # Activation function
-        if activation == 'tanh':
-            self.sigma = torch.tanh
-        elif activation == 'gelu':
+        self.alpha = nn.Parameter(torch.empty(config.hidden_size))
+        self.W = nn.Parameter(torch.empty(config.hidden_size, config.hidden_size))
+        self.U = nn.Parameter(torch.empty(config.hidden_size, config.hidden_size))
+        self.b = nn.Parameter(torch.empty(config.hidden_size))
+
+        if config.activation == 'gelu':
             self.sigma = nn.GELU()
         else:
-            raise NotImplementedError(f"Activation '{activation}' not supported.")
-            
-        # Note on block sparsity for W:
-        # For a real implementation, W would be initialized with a block-sparse
-        # structure and a mask would be applied during the forward pass to maintain sparsity.
-        # For this initial version, we use a dense matrix for simplicity.
+            self.sigma = torch.tanh
 
-        # Note on residual connection:
-        # The term `lambda * u` is added to the state dynamics. This is only
-        # directly possible if input_size == hidden_size. If not, a projection
-        # layer would be required. We will proceed assuming this condition holds
-        # when lambda_res > 0.
-
-
-    def forward(self, t, x, u):
-        """
-        The ODE function dx/dt = f(t, x, u).
-        
-        Args:
-            t (torch.Tensor): Current time (unused, for compatibility with odeint).
-            x (torch.Tensor): Hidden state of shape (batch_size, hidden_size).
-            u (torch.Tensor): Input of shape (batch_size, input_size).
-            
-        Returns:
-            torch.Tensor: The derivative of the hidden state, dx/dt.
-        """
-        # Main LNN dynamics
-        dx_dt = -self.alpha * x + self.sigma(
-            x @ self.W.T + u @ self.U.T + self.b
-        )
-
-        # Add residual connection from the input
-        # Add residual connection only if dimensions match
-        if self.lambda_res > 0 and x.shape[-1] == u.shape[-1]:
+    def forward(self, h, u):
+        """The ODE function dx/dt = f(t, x, u)."""
+        dx_dt = -self.alpha * h + self.sigma(h @ self.W.T + u @ self.U.T + self.b)
+        if self.lambda_res > 0:
             dx_dt = dx_dt + self.lambda_res * u
-
         return dx_dt
 
-class LNN(nn.Module):
-    """
-    Liquid Neural Network layer that processes a sequence of inputs by solving
-    the underlying ODE for each step.
-    """
-    def __init__(self, input_size, hidden_size, **kwargs):
+# --- 3. LNN Block (Layer + Residual) ---
+class LNNBlock(nn.Module):
+    """A purely recurrent block using an LNN layer with a residual connection."""
+    def __init__(self, config: LNNConfig):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.cell = LNNCell(input_size, hidden_size, **kwargs)
+        self.cell = LNNCell(config)
+        self.norm = nn.LayerNorm(config.hidden_size)
+        self.dt = 1.0 # Time step for Euler integration
 
-
-
-    def forward(self, u, h0=None):
-        """
-        Processes a sequence of inputs through the LNN.
-        
-        Args:
-            u (torch.Tensor): Input sequence of shape (seq_len, batch_size, input_size).
-            h0 (torch.Tensor, optional): Initial hidden state. Defaults to zeros.
-            
-        Returns:
-            torch.Tensor: Output sequence of hidden states of shape (seq_len, batch_size, hidden_size).
-        """
-        seq_len, batch_size, _ = u.shape
-
-        # Meta device guard for `torchdiffeq.odeint` compatibility.
-        if u.device.type == 'meta':
-            return torch.zeros(seq_len, batch_size, self.hidden_size, device='meta')
-
-        if h0 is None:
-            h0 = torch.zeros(batch_size, self.hidden_size, device=self.cell.b.device)
-
-        # Create t_span on the correct device, right before it's needed.
-        t_span = torch.tensor([0.0, 1.0], device=h0.device)
-
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        h = torch.zeros(batch_size, self.cell.hidden_size, device=x.device, dtype=x.dtype)
         outputs = []
-        h = h0
-
         for i in range(seq_len):
-            ode_func = lambda t, x: self.cell(t, x, u[i])
-            h_next = odeint(ode_func, h, t_span, method='rk4')[1]
-            outputs.append(h_next)
-            h = h_next
+            dx_dt = self.cell(h=h, u=x[:, i, :])
+            h = h + self.dt * dx_dt # Euler integration
+            outputs.append(h.unsqueeze(1))
+        
+        return self.norm(x + torch.cat(outputs, dim=1))
 
-        return torch.stack(outputs, dim=0)
+# --- 4. Full, HF-Compatible LNN Model ---
+class LNNModel(PreTrainedModel):
+    """The complete LNN model, compatible with Hugging Face's `save_pretrained`."""
+    config_class = LNNConfig
+    _supports_gradient_checkpointing = True
+
+    def __init__(self, config: LNNConfig):
+        super().__init__(config)
+        self.config = config
+        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([LNNBlock(config) for _ in range(config.num_hidden_layers)])
+        self.final_norm = nn.LayerNorm(config.hidden_size)
+        self.output_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(self, input_ids, labels=None, **kwargs):
+        x = self.embeddings(input_ids)
+        
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                 x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+
+        x = self.final_norm(x)
+        logits = self.output_head(x)
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            logits_flat = logits.view(-1, self.config.vocab_size)
+            labels_flat = labels.view(-1)
+            loss = loss_fct(logits_flat, labels_flat)
+
+        if loss is not None:
+            return (loss, logits)
+        else:
+            return (logits,)
