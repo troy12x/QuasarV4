@@ -89,7 +89,7 @@ class Quasar(PreTrainedModel):
         kwargs['config'] = self.config
 
         for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
+            if self.is_gradient_checkpointing and self.training:
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(*inputs)
