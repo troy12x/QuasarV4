@@ -10,7 +10,7 @@ import sys
 # Add project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from quasar.model import Quasar
+from quasar.model import Quasar, QuasarConfig
 from quasar.transformer_model import TransformerModel
 from quasar.utils import SimpleTokenizer, prepare_batch
 
