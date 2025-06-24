@@ -10,31 +10,32 @@ import sys
 # Add project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from quasar.model import Quasar, QuasarConfig
+# Import LNN model and Transformer for comparison
+from quasar.lnn import LNNModel, LNNConfig
 from quasar.transformer_model import TransformerModel
 from quasar.utils import SimpleTokenizer, prepare_batch
 
 # --- Configuration ---
 EMBEDDING_DIM = 128
-HIDDEN_DIM = 256
+HIDDEN_DIM = 256  # For Transformer's feed-forward layer
 LEARNING_RATE = 0.001
 NUM_EPOCHS = 15
 BATCH_SIZE = 4
 
-# Transformer-specific config
-NHEAD = 4 # Number of attention heads
-NLAYERS = 2 # Number of transformer layers
+# Model-specific configs
+NHEAD = 4       # For Transformer
+NLAYERS = 2     # For both models
+ACTIVATION = 'tanh' # For LNN
+DT = 1.0        # For LNN
 
 # --- Dummy Data ---
 dummy_corpus = [
-    "The Quasar model is a new architecture for language understanding.",
+    "The LNN model is a new architecture for language understanding.",
     "It uses a Liquid Neural Network instead of a Transformer.",
-    "Memory is handled by a Parameter Memory Bank.",
     "This allows for potentially infinite context length.",
-    "Text is segmented using a semantic chunker.",
     "The goal is to achieve high performance without attention mechanisms.",
     "Training is done using a standard next-token prediction loss.",
-    "This script demonstrates a basic training loop for the Quasar model.",
+    "This script demonstrates a basic training loop for the LNN model.",
     "A standard transformer uses self-attention to process sequences.",
     "Positional encodings are needed to understand token order.",
     "Transformers can have very large parameter counts.",
@@ -45,15 +46,17 @@ def train_model(model, tokenizer, device, model_name):
     """A generic function to train a model and report metrics."""
     print(f"\n--- Training {model_name} ---")
     model.to(device)
+    model.train()  # Set model to training mode
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.vocab['<pad>'])
 
     start_time = time.time()
-    
+
     for epoch in range(NUM_EPOCHS):
         total_loss = 0
+        num_batches = 0
         for i in range(0, len(dummy_corpus), BATCH_SIZE):
-            batch_texts = dummy_corpus[i:i+BATCH_SIZE]
+            batch_texts = dummy_corpus[i:i + BATCH_SIZE]
             if not batch_texts: continue
 
             batch_tensor = prepare_batch(batch_texts, tokenizer, device)
@@ -61,20 +64,26 @@ def train_model(model, tokenizer, device, model_name):
             targets = batch_tensor[:, 1:]
 
             optimizer.zero_grad()
-            logits = model(inputs)
-            last_token_target = targets[:, -1]
-            loss = criterion(logits, last_token_target)
+
+            # Get logits from the model
+            output = model(inputs)
+            logits = output.logits if hasattr(output, 'logits') else output
+
+            # Reshape for CrossEntropyLoss: (batch * seq_len, vocab_size)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        
+            num_batches += 1
+
         if (epoch + 1) % 5 == 0:
-            avg_loss = total_loss / (len(dummy_corpus) // BATCH_SIZE)
-            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {avg_loss:.4f}")
+            avg_loss = total_loss / num_batches
+            print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}], Loss: {avg_loss:.4f}")
 
     end_time = time.time()
     training_time = end_time - start_time
-    final_loss = total_loss / (len(dummy_corpus) // BATCH_SIZE)
+    final_loss = total_loss / num_batches
 
     print(f"Training complete for {model_name}.")
     print(f"Final Loss: {final_loss:.4f}")
@@ -90,18 +99,17 @@ def main():
     vocab_size = len(tokenizer)
     print(f"Vocabulary size: {vocab_size}")
 
-    # Initialize Models
-    config = QuasarConfig(
+    # Initialize LNN Model
+    lnn_config = LNNConfig(
         vocab_size=vocab_size,
-        embedding_dim=EMBEDDING_DIM,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_experts=4,
-        expert_dim=256,
-        top_k=2
+        hidden_size=EMBEDDING_DIM,
+        num_hidden_layers=NLAYERS,
+        activation=ACTIVATION,
+        dt=DT
     )
-    quasar_model = Quasar(config)
+    lnn_model = LNNModel(lnn_config)
 
+    # Initialize Transformer Model
     transformer_model = TransformerModel(
         vocab_size=vocab_size,
         embedding_dim=EMBEDDING_DIM,
@@ -111,16 +119,17 @@ def main():
     )
 
     # Train and Compare
-    quasar_time, quasar_loss = train_model(quasar_model, tokenizer, device, "Quasar")
+    lnn_time, lnn_loss = train_model(lnn_model, tokenizer, device, "LNN")
     transformer_time, transformer_loss = train_model(transformer_model, tokenizer, device, "Transformer")
 
     # --- Final Report ---
     print("\n--- Comparison Report ---")
-    print(f"                        | Quasar      | Transformer")
+    print(f"                        | LNN         | Transformer")
     print(f"------------------------|-------------|-------------")
-    print(f"Training Time (s)     | {quasar_time:<11.2f} | {transformer_time:<11.2f}")
-    print(f"Final Loss              | {quasar_loss:<11.4f} | {transformer_loss:<11.4f}")
+    print(f"Training Time (s)     | {lnn_time:<11.2f} | {transformer_time:<11.2f}")
+    print(f"Final Loss              | {lnn_loss:<11.4f} | {transformer_loss:<11.4f}")
     print(f"------------------------|-------------|-------------")
 
 if __name__ == '__main__':
     main()
+

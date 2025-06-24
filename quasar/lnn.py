@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.utils.generic import ModelOutput
 from typing import Optional, Tuple, List
+from .pmb import ParameterMemoryBank
 
 # --- 1. Configuration Class ---
 class LNNConfig(PretrainedConfig):
@@ -34,6 +35,12 @@ class LNNConfig(PretrainedConfig):
         num_hidden_layers=96,
         activation='gelu',
         lambda_res=0.0,
+        dt=1.0,
+        initializer_range=0.02,
+        use_pmb=False,
+        pmb_num_blocks=1024,
+        pmb_slots_per_block=4096,
+        pmb_top_k=1,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -42,6 +49,11 @@ class LNNConfig(PretrainedConfig):
         self.lambda_res = lambda_res
         self.activation = activation
         self.dt = dt
+        self.initializer_range = initializer_range
+        self.use_pmb = use_pmb
+        self.pmb_num_blocks = pmb_num_blocks
+        self.pmb_slots_per_block = pmb_slots_per_block
+        self.pmb_top_k = pmb_top_k
         super().__init__(**kwargs)
 
 # --- 2. Custom Model Output ---
@@ -71,16 +83,6 @@ class LNNCell(nn.Module):
             self.sigma = nn.GELU()
         else:
             self.sigma = torch.tanh
-        
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights."""
-        nn.init.kaiming_uniform_(self.W, a=0.01)
-        nn.init.kaiming_uniform_(self.U, a=0.01)
-        nn.init.zeros_(self.b)
-        # Initialize tau to be around 1.0 after softplus
-        nn.init.uniform_(self.tau, 0.5, 1.5)
 
     def forward(self, h, u):
         """
@@ -113,10 +115,12 @@ class LNNBlock(nn.Module):
         self.norm = nn.LayerNorm(config.hidden_size)
         self.dt = config.dt
 
-    def forward(self, h, u):
+    def forward(self, h, u, pmb=None, pmb_top_k=0):
         """
         h: hidden state (batch_size, hidden_size)
         u: input (batch_size, hidden_size)
+        pmb: ParameterMemoryBank instance
+        pmb_top_k: Number of memories to retrieve
         """
         # Get the change in hidden state from the cell
         dx_dt = self.cell(h, u)
@@ -124,8 +128,17 @@ class LNNBlock(nn.Module):
         # Euler integration step
         h_next = h + self.dt * dx_dt
         
-        # Residual connection and LayerNorm
-        output = self.norm(h_next + u)
+        # --- PMB Integration ---
+        retrieved_memory = 0
+        if pmb is not None and len(pmb) > 0 and pmb_top_k > 0:
+            # Query PMB with the new hidden state
+            # Note: This assumes the PMB's value dimension matches the hidden_size
+            retrieved_memory_batch = pmb.retrieve_semantic(h_next, top_k=pmb_top_k)
+            # Average the retrieved memories (B, K, D) -> (B, D)
+            retrieved_memory = retrieved_memory_batch.mean(dim=1)
+
+        # Residual connection and LayerNorm, now with memory
+        output = self.norm(h_next + u + retrieved_memory)
         
         return output
 
@@ -144,6 +157,13 @@ class LNNModel(PreTrainedModel):
         
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([LNNBlock(config) for _ in range(config.num_hidden_layers)])
+        
+        # Initialize Parameter Memory Bank if enabled
+        self.pmb = ParameterMemoryBank(
+            num_blocks=config.pmb_num_blocks,
+            slots_per_block=config.pmb_slots_per_block
+        ) if config.use_pmb else None
+
         self.final_ln = nn.LayerNorm(config.hidden_size)
         self.output_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
@@ -155,12 +175,19 @@ class LNNModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initializes weights of the model."""
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+        elif isinstance(module, LNNCell):
+            # Initialize LNNCell-specific parameters
+            nn.init.kaiming_uniform_(module.W, a=0.01)
+            nn.init.kaiming_uniform_(module.U, a=0.01)
+            nn.init.zeros_(module.b)
+            # Initialize tau to be around 1.0 after softplus
+            nn.init.uniform_(module.tau, 0.5, 1.5)
 
     def forward(
         self,
@@ -189,6 +216,21 @@ class LNNModel(PreTrainedModel):
         all_layer_outputs = [] if output_hidden_states else None
         outputs_over_time = []
 
+        # --- PMB Store Operation (Conceptual) ---
+        # A real implementation would need a more robust strategy for when and what to store.
+        # For this demonstration, we'll populate the PMB with the input embeddings so it has memory to retrieve.
+        if self.pmb is not None and self.training:
+            with torch.no_grad():
+                # Store each token embedding from the batch. This is inefficient but populates the PMB.
+                for i in range(input_ids.size(1)):
+                    for j in range(input_ids.size(0)):
+                        # Using a simple, non-unique ID for demonstration.
+                        # A robust solution needs a proper content-addressable or unique ID scheme.
+                        item_id = f"batch_{j}_token_{i}"
+                        embedding_vector = x[j, i, :].detach()
+                        # In this simple case, the key and value are the same.
+                        self.pmb.store(item_id, embedding_vector, embedding_vector)
+
         # 3. Process sequence token by token (recurrently)
         for t in range(seq_len):
             current_input_token = x[:, t, :]
@@ -196,45 +238,41 @@ class LNNModel(PreTrainedModel):
             layer_input = current_input_token
             next_hidden_states = []
 
-            if output_hidden_states:
-                all_layer_outputs.append([])
-
             for i, layer in enumerate(self.layers):
-                h = hidden_states[i]
+                h_current = hidden_states[i]
                 
                 if self.gradient_checkpointing and self.training:
-                    def create_custom_forward(module):
-                        def custom_forward(*inputs):
-                            return module(*inputs)
-                        return custom_forward
-                    
-                    output = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(layer),
-                        h,
-                        layer_input,
-                        use_reentrant=False
+                    # use_reentrant=False is more modern and memory-efficient
+                    layer_output = torch.utils.checkpoint.checkpoint(
+                        layer, h_current, layer_input, self.pmb, self.config.pmb_top_k, use_reentrant=False
                     )
                 else:
-                    output = layer(h, layer_input)
-                
-                next_hidden_states.append(output)
-                layer_input = output
-                if output_hidden_states:
-                    all_layer_outputs[-1].append(output)
+                    layer_output = layer(h_current, layer_input, self.pmb, self.config.pmb_top_k)
+
+                next_hidden_states.append(layer_output)
+                layer_input = layer_output # Input to next layer is output of current
 
             hidden_states = next_hidden_states
-            outputs_over_time.append(layer_input)
+            
+            # 4. Get final output from the last layer for this time step
+            final_output = hidden_states[-1]
+            outputs_over_time.append(final_output)
 
-        # 4. Stack outputs and apply final layers
-        output_tensor = torch.stack(outputs_over_time, dim=1)
-        output_tensor = self.final_ln(output_tensor)
-        logits = self.output_head(output_tensor)
+            if output_hidden_states:
+                all_layer_outputs.append(hidden_states)
+
+        # 5. Stack outputs over time
+        last_hidden_state = torch.stack(outputs_over_time, dim=1)
+        
+        # 6. Final LayerNorm and output projection
+        last_hidden_state = self.final_ln(last_hidden_state)
+        logits = self.output_head(last_hidden_state)
 
         if not return_dict:
-            return (logits, output_tensor) + (all_layer_outputs,)
+            return (logits, last_hidden_state, all_layer_outputs)
 
         return LNNModelOutput(
+            last_hidden_state=last_hidden_state,
             logits=logits,
-            last_hidden_state=output_tensor,
-            hidden_states=hidden_states # Return final hidden states of all layers
+            hidden_states=all_layer_outputs,
         )

@@ -31,8 +31,6 @@ def generate_config_file(output_dir):
 
         # --- Tokenizer & Vocab ---
         "vocab_size": 151552,
-        "bos_token_id": 100006, # Standard for deepseek tokenizer
-        "eos_token_id": 100007, # Standard for deepseek tokenizer
         "tie_word_embeddings": False,
 
         # --- Technical Details ---
@@ -40,11 +38,7 @@ def generate_config_file(output_dir):
         "layer_norm_eps": 1e-5, # Default for torch.nn.LayerNorm
         "torch_dtype": "bfloat16",
 
-        # --- HF Ecosystem Integration ---
-        "auto_map": {
-            "AutoConfig": "quasar.model.QuasarConfig",
-            "AutoModelForCausalLM": "quasar.model.Quasar"
-        }
+
     }
 
     # Ensure the output directory exists

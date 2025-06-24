@@ -91,46 +91,69 @@ class ParameterMemoryBank:
             return item[2] # Return the value
         return None
 
-    def retrieve_semantic(self, query_embedding, top_k=5):
+    def retrieve_by_indices(self, indices):
         """
-        Retrieves the top_k most semantically similar items to a query embedding.
-        
+        Retrieves items by their indices in the `all_keys` list.
         Args:
-            query_embedding (torch.Tensor): The query vector.
-            top_k (int): The number of similar items to return.
-            
+            indices (list or torch.Tensor): A list of indices.
         Returns:
-            A list of tuples, each containing (similarity_score, value).
+            A list of the retrieved values.
         """
-        if not self.all_keys:
-            return []
-            
-        if not isinstance(query_embedding, torch.Tensor):
-            raise TypeError("query_embedding must be a torch.Tensor")
+        results = []
+        for idx in indices:
+            block_idx, slot_idx = self.key_locations[idx]
+            item = self.pmb[block_idx][slot_idx]
+            if item:
+                results.append(item[2]) # Return the value
+        return results
+
+    def retrieve_semantic(self, query_embeddings, top_k=1):
+        """
+        Retrieves the top_k most semantically similar items for a batch of query embeddings.
+
+        Args:
+            query_embeddings (torch.Tensor): A batch of query vectors (batch_size, embedding_dim).
+            top_k (int): The number of similar items to return for each query.
+
+        Returns:
+            A tensor of the retrieved values (batch_size, top_k, value_dim).
+        """
+        if not self.all_keys or top_k == 0:
+            return torch.zeros(query_embeddings.size(0), top_k, query_embeddings.size(-1), device=query_embeddings.device)
+
+        if not isinstance(query_embeddings, torch.Tensor):
+            raise TypeError("query_embeddings must be a torch.Tensor")
 
         # Concatenate all keys into a single tensor for efficient computation
-        all_keys_tensor = torch.cat(self.all_keys, dim=0).to(query_embedding.device)
-        
-        # Compute cosine similarity
-        query_norm = torch.nn.functional.normalize(query_embedding.unsqueeze(0), p=2, dim=1)
+        all_keys_tensor = torch.cat(self.all_keys, dim=0).to(query_embeddings.device)
+
+        # Compute cosine similarity in a batch
+        query_norm = torch.nn.functional.normalize(query_embeddings, p=2, dim=1)
         keys_norm = torch.nn.functional.normalize(all_keys_tensor, p=2, dim=1)
-        similarities = torch.mm(query_norm, keys_norm.T).squeeze(0)
-        
-        # Get top_k results
-        top_k_scores, top_k_indices = torch.topk(similarities, k=min(top_k, len(self.all_keys)))
-        
-        results = []
-        for i in range(len(top_k_indices)):
-            score = top_k_scores[i].item()
-            original_idx = top_k_indices[i].item()
+        similarities = torch.mm(query_norm, keys_norm.T)
+
+        # Get top_k results for each query in the batch
+        top_k_scores, top_k_indices = torch.topk(similarities, k=min(top_k, len(self.all_keys)), dim=1)
+
+        # Retrieve the corresponding values
+        # This part is tricky as it mixes batch and non-batch operations.
+        # For now, we'll iterate, but a fully vectorized solution would be better.
+        batch_results = []
+        for i in range(top_k_indices.size(0)):
+            # Get the actual values for the top_k indices for this batch item
+            retrieved_values = self.retrieve_by_indices(top_k_indices[i])
             
-            block_idx, slot_idx = self.key_locations[original_idx]
-            item = self.pmb[block_idx][slot_idx]
-            
-            if item:
-                results.append((score, item[2])) # (similarity_score, value)
+            # Assuming values are tensors, we stack them.
+            if retrieved_values:
+                # Ensure all retrieved values are tensors of the same shape
+                # This is a strong assumption for a general-purpose PMB
+                batch_results.append(torch.stack(retrieved_values, dim=0))
+            else:
+                # Handle case where no items are retrieved
+                batch_results.append(torch.zeros(top_k, query_embeddings.size(-1), device=query_embeddings.device))
         
-        return results
+        # Stack results for all items in the batch
+        return torch.stack(batch_results, dim=0)
 
     def __len__(self):
         return len(self.all_keys)
