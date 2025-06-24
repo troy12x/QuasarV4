@@ -5,24 +5,26 @@ import torch.nn as nn
 import math
 
 class PositionalEncoding(nn.Module):
-    """Injects some information about the relative or absolute position of the tokens in the sequence."""
+    """Injects positional information into the input tensor. Supports batch_first."""
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
 
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        # Shape: (1, max_len, d_model) for batch_first=True
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
         """
         Args:
-            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+            x: Tensor, shape [batch_size, seq_len, embedding_dim]
         """
-        x = x + self.pe[:x.size(0)]
+        # Add positional encoding to the input tensor
+        x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
 class TransformerModel(nn.Module):
@@ -59,24 +61,22 @@ class TransformerModel(nn.Module):
             src: Tensor, shape [batch_size, seq_len]
 
         Returns:
-            output: Tensor, shape [batch_size, vocab_size]
+            output: Tensor, shape [batch_size, seq_len, vocab_size]
         """
-        # Get embeddings and add positional encoding
-        # Transformer layers expect (seq_len, batch_size, embedding_dim)
-        src = self.embedding(src) * math.sqrt(self.embedding_dim)
-        # Our implementation uses batch_first=True, so shape is (batch_size, seq_len, embedding_dim)
+        # 1. Get embeddings
+        src_emb = self.embedding(src) * math.sqrt(self.embedding_dim)
+        
+        # 2. Apply positional encoding
+        src_pos = self.pos_encoder(src_emb)
 
-        # Generate causal mask
+        # 3. Generate causal mask for the decoder
         mask = self._generate_square_subsequent_mask(src.size(1)).to(src.device)
 
-        # The TransformerDecoder expects target and memory. For a decoder-only
-        # setup, we pass the same input as both target and memory.
-        output = self.transformer_decoder(tgt=src, memory=src, tgt_mask=mask, memory_mask=mask)
+        # 4. Pass through the Transformer decoder
+        # For a decoder-only setup, target and memory are the same.
+        output = self.transformer_decoder(tgt=src_pos, memory=src_pos, tgt_mask=mask, memory_mask=mask)
         
-        # We only need the output for the very last token for next-token prediction
-        last_output = output[:, -1, :] # (batch_size, embedding_dim)
-        
-        # Final linear layer
-        output_logits = self.output_layer(last_output)
+        # 5. Apply the final linear layer to the entire sequence
+        output_logits = self.output_layer(output)
         
         return output_logits

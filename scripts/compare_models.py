@@ -105,9 +105,22 @@ def main():
         hidden_size=EMBEDDING_DIM,
         num_hidden_layers=NLAYERS,
         activation=ACTIVATION,
-        dt=DT
+        dt=DT,
+        use_pmb=False
     )
     lnn_model = LNNModel(lnn_config)
+
+    # Initialize LNN Model with PMB
+    lnn_pmb_config = LNNConfig(
+        vocab_size=vocab_size,
+        hidden_size=EMBEDDING_DIM,
+        num_hidden_layers=NLAYERS,
+        activation=ACTIVATION,
+        dt=DT,
+        use_pmb=True,
+        pmb_top_k=1 # Retrieve top 1 memory
+    )
+    lnn_pmb_model = LNNModel(lnn_pmb_config)
 
     # Initialize Transformer Model
     transformer_model = TransformerModel(
@@ -120,15 +133,16 @@ def main():
 
     # Train and Compare
     lnn_time, lnn_loss = train_model(lnn_model, tokenizer, device, "LNN")
+    lnn_pmb_time, lnn_pmb_loss = train_model(lnn_pmb_model, tokenizer, device, "LNN with PMB")
     transformer_time, transformer_loss = train_model(transformer_model, tokenizer, device, "Transformer")
 
     # --- Final Report ---
     print("\n--- Comparison Report ---")
-    print(f"                        | LNN         | Transformer")
-    print(f"------------------------|-------------|-------------")
-    print(f"Training Time (s)     | {lnn_time:<11.2f} | {transformer_time:<11.2f}")
-    print(f"Final Loss              | {lnn_loss:<11.4f} | {transformer_loss:<11.4f}")
-    print(f"------------------------|-------------|-------------")
+    print(f"                        | LNN         | LNN + PMB   | Transformer")
+    print(f"------------------------|-------------|-------------|-------------")
+    print(f"Training Time (s)     | {lnn_time:<11.2f} | {lnn_pmb_time:<11.2f} | {transformer_time:<11.2f}")
+    print(f"Final Loss              | {lnn_loss:<11.4f} | {lnn_pmb_loss:<11.4f} | {transformer_loss:<11.4f}")
+    print(f"------------------------|-------------|-------------|-------------")
 
 if __name__ == '__main__':
     main()

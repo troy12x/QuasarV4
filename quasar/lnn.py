@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.utils.generic import ModelOutput
 from typing import Optional, Tuple, List
+from dataclasses import dataclass
 from .pmb import ParameterMemoryBank
 
 # --- 1. Configuration Class ---
@@ -57,6 +58,7 @@ class LNNConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 # --- 2. Custom Model Output ---
+@dataclass
 class LNNModelOutput(ModelOutput):
     """
     Base class for LNN model's outputs, ensuring compatibility with HuggingFace.

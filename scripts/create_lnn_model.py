@@ -31,7 +31,8 @@ def create_and_save_lnn_model(args):
         num_hidden_layers=args.num_layers,
         activation=args.activation,
         lambda_res=args.lambda_res,
-        dt=args.dt
+        dt=args.dt,
+        use_pmb=args.use_pmb
     )
 
     # Initialize model using the new LNNModel
@@ -72,6 +73,7 @@ def main():
     parser.add_argument("--lambda_res", type=float, default=0.0, help="Strength of the residual connection in the LNN cell.")
     parser.add_argument("--dt", type=float, default=1.0, help="Time step for the Euler integration.")
     parser.add_argument('--max_shard_size', type=str, default='1GB', help='Maximum size of each model shard.')
+    parser.add_argument('--use-pmb', action='store_true', help='Enable the Parameter Memory Bank in the model.')
 
     args = parser.parse_args()
     create_and_save_lnn_model(args)
