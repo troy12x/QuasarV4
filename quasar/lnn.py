@@ -222,6 +222,10 @@ class LNNModel(PreTrainedModel):
         self.gradient_checkpointing = False
         print("  [LNNModel] Final components created.")
 
+        # Since post_init is bypassed, we manually initialize the embedding weights.
+        print("  [LNNModel] Initializing embedding weights...")
+        self.embedding.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+
         # Manually tie the weights directly, bypassing post_init and _init_weights completely.
         print("  [LNNModel] Manually tying output and embedding weights...")
         self.proj_out.weight = self.embedding.weight
