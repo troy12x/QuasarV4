@@ -40,8 +40,8 @@ class MoELayer(nn.Module):
         self.num_experts = num_experts
 
         # Create experts
-        experts = [Expert(embedding_dim, expert_dim) for _ in range(self.num_experts)]
-        self.experts = nn.ModuleList(experts)
+        # Use a generator expression to avoid creating a temporary list of all experts in memory
+        self.experts = nn.ModuleList(Expert(embedding_dim, expert_dim) for _ in range(self.num_experts))
 
     def forward(self, x):
         """Forward pass for the MoE layer."""

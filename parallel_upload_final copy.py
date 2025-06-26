@@ -11,7 +11,7 @@ import concurrent.futures
 from functools import partialmethod
 
 from huggingface_hub import HfApi, create_repo
-
+from transformers import AutoTokenizer
 from rich.progress import (
     Progress,
     BarColumn,
@@ -22,10 +22,10 @@ from rich.progress import (
 from tqdm.auto import tqdm
 
 # --- Configuration ---
-HF_REPO = "silx-ai/QuasarV4-440B-LNN"
+HF_REPO = "silx-ai/QuasarV4-15B-A5B"
 HF_TOKEN = "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"
 MODEL_DIR = "./model"
-
+TOKENIZER_PATH = "deepseek-ai/DeepSeek-V3-0324"
 MAX_WORKERS = 10  # Number of files to upload at the same time
 START_SHARD = 0 # Start uploading from the shard AFTER this one
 
@@ -126,40 +126,14 @@ def upload_model():
         # Restore the original tqdm behavior
         tqdm.__init__ = original_tqdm_init
 
-    # --- Upload Auxiliary Files (sequentially) ---
-    print("\nUploading auxiliary files...")
-
-    # 1. Upload model.safetensors.index.json
-    index_file_path = os.path.join(MODEL_DIR, 'model.safetensors.index.json')
-    if os.path.exists(index_file_path):
-        print("Found model.safetensors.index.json. Uploading...")
-        try:
-            api.upload_file(
-                path_or_fileobj=index_file_path,
-                path_in_repo='model.safetensors.index.json',
-                repo_id=HF_REPO,
-                token=HF_TOKEN
-            )
-            print("✅ Model index uploaded successfully.")
-        except Exception as e:
-            print(f"❌ Could not upload model index: {e}")
-    else:
-        print("⚠️ model.safetensors.index.json not found. Skipping.")
-
-    # 2. Upload tokenizer and other config files from the model directory
-    print("\nUploading tokenizer and config files...")
+    # --- Upload Tokenizer (sequentially) ---
+    print("\nUploading tokenizer...")
     try:
-        # Use upload_folder to sync the rest of the directory, ignoring the huge model shards
-        # that have already been uploaded. This will upload tokenizer.*, config.json, etc.
-        api.upload_folder(
-            folder_path=MODEL_DIR,
-            repo_id=HF_REPO,
-            token=HF_TOKEN,
-            ignore_patterns=["*.safetensors"],
-        )
-        print("✅ Tokenizer and config files uploaded successfully.")
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, token=HF_TOKEN)
+        tokenizer.save_pretrained(HF_REPO, push_to_hub=True, token=HF_TOKEN)
+        print("Tokenizer uploaded successfully.")
     except Exception as e:
-        print(f"❌ Could not upload tokenizer/config files: {e}")
+        print(f"Could not upload tokenizer: {e}")
 
     print(f"\n--- Process Complete ---")
 

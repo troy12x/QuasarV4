@@ -65,12 +65,17 @@ def train_model(model, tokenizer, device, model_name):
 
             optimizer.zero_grad()
 
-            # Get logits from the model
+            # Get output from the model
             output = model(inputs)
             logits = output.logits if hasattr(output, 'logits') else output
 
             # Reshape for CrossEntropyLoss: (batch * seq_len, vocab_size)
             loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+            # Add MoE load balancing loss if applicable
+            if hasattr(output, 'load_balancing_loss') and output.load_balancing_loss is not None:
+                load_balancing_loss = output.load_balancing_loss
+                loss += model.config.moe_load_balance_loss_weight * load_balancing_loss
 
             loss.backward()
             optimizer.step()
@@ -122,6 +127,21 @@ def main():
     )
     lnn_pmb_model = LNNModel(lnn_pmb_config)
 
+    # Initialize LNN Model with MoE
+    lnn_moe_config = LNNConfig(
+        vocab_size=vocab_size,
+        hidden_size=EMBEDDING_DIM,
+        num_hidden_layers=NLAYERS,
+        activation=ACTIVATION,
+        dt=DT,
+        use_pmb=False, # Isolate MoE for this comparison
+        use_moe=True,
+        num_experts=4,
+        num_experts_per_tok=2,
+        expert_dim=EMBEDDING_DIM * 2
+    )
+    lnn_moe_model = LNNModel(lnn_moe_config)
+
     # Initialize Transformer Model
     transformer_model = TransformerModel(
         vocab_size=vocab_size,
@@ -134,15 +154,16 @@ def main():
     # Train and Compare
     lnn_time, lnn_loss = train_model(lnn_model, tokenizer, device, "LNN")
     lnn_pmb_time, lnn_pmb_loss = train_model(lnn_pmb_model, tokenizer, device, "LNN with PMB")
+    lnn_moe_time, lnn_moe_loss = train_model(lnn_moe_model, tokenizer, device, "LNN with MoE")
     transformer_time, transformer_loss = train_model(transformer_model, tokenizer, device, "Transformer")
 
     # --- Final Report ---
     print("\n--- Comparison Report ---")
-    print(f"                        | LNN         | LNN + PMB   | Transformer")
-    print(f"------------------------|-------------|-------------|-------------")
-    print(f"Training Time (s)     | {lnn_time:<11.2f} | {lnn_pmb_time:<11.2f} | {transformer_time:<11.2f}")
-    print(f"Final Loss              | {lnn_loss:<11.4f} | {lnn_pmb_loss:<11.4f} | {transformer_loss:<11.4f}")
-    print(f"------------------------|-------------|-------------|-------------")
+    print(f"                        | LNN         | LNN + PMB   | LNN + MoE   | Transformer")
+    print(f"------------------------|-------------|-------------|-------------|-------------")
+    print(f"Training Time (s)     | {lnn_time:<11.2f} | {lnn_pmb_time:<11.2f} | {lnn_moe_time:<11.2f} | {transformer_time:<11.2f}")
+    print(f"Final Loss              | {lnn_loss:<11.4f} | {lnn_pmb_loss:<11.4f} | {lnn_moe_loss:<11.4f} | {transformer_loss:<11.4f}")
+    print(f"------------------------|-------------|-------------|-------------|-------------")
 
 if __name__ == '__main__':
     main()

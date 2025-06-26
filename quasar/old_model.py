@@ -12,11 +12,11 @@ class QuasarConfig(PretrainedConfig):
         self,
         vocab_size=129280,
         embedding_dim=8192,
-        num_hidden_layers=96,  # 96 layers to keep active parameters manageable
+        num_hidden_layers=96,
         num_attention_heads=64,
-        num_experts=407,   # 407 experts to reach 440B total parameters
-        expert_dim=32768,  # 32K expert dimension for capacity
-        top_k=4,          # 4 active experts per token to maintain 25B active params
+        num_experts=128,
+        expert_dim=2048,
+        top_k=4,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -89,7 +89,7 @@ class Quasar(PreTrainedModel):
         kwargs['config'] = self.config
 
         for layer in self.layers:
-            if self.is_gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(*inputs)
