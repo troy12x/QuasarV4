@@ -14,6 +14,7 @@
 
 import torch
 import torch.nn as nn
+from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.utils.generic import ModelOutput
@@ -30,7 +31,7 @@ class LNNConfig(PretrainedConfig):
     Configuration class for the Liquid Neural Network (LNN) model.
     Inherits from HuggingFace's PretrainedConfig.
     """
-    model_type = "lnn"
+    model_type = "quasar"
 
     def __init__(
         self,
@@ -78,6 +79,7 @@ class LNNModelOutput(ModelOutput):
     """
     Base class for LNN model's outputs, ensuring compatibility with HuggingFace.
     """
+    loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     last_hidden_state: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -118,18 +120,25 @@ class LNNCell(nn.Module):
         h: hidden state (batch_size, hidden_size)
         u: input (batch_size, hidden_size)
         """
+        # --- Robust Device Placement ---
+        # This is a defensive workaround for a stubborn issue where some model parameters
+        # are not being moved to the correct device by DeepSpeed. We explicitly move
+        # the parameters to the same device as the input tensor `h` for this calculation.
+        device = h.device
+
         # Ensure tau is positive
-        tau_positive = F.softplus(self.tau)
+        tau_positive = F.softplus(self.tau.to(device))
         
         # dX/dt = -1/τ * X + σ(W·X + U·u + b)
         decay_term = -h / tau_positive
-        activation_input = F.linear(h, self.W) + F.linear(u, self.U) + self.b
+        activation_input = F.linear(h, self.W.to(device)) + F.linear(u, self.U.to(device)) + self.b.to(device)
         activation_output = self.sigma(activation_input)
         
         dx_dt = decay_term + activation_output
         
         # Optional residual connection on the input
         if self.lambda_res > 0:
+            # Note: lambda_res is a float, not a tensor, so no .to(device) needed.
             dx_dt = dx_dt + self.lambda_res * u
             
         return dx_dt
@@ -156,6 +165,13 @@ class LNNBlock(nn.Module):
             self.ln_2 = nn.LayerNorm(config.hidden_size)
 
     def forward(self, x, hidden_state, pmb=None):
+        # --- Definitive Device Placement Fix ---
+        # This is the final, robust fix for the device mismatch errors. It ensures
+        # that the hidden state is on the correct GPU device at the start of every
+        # block computation, regardless of what happened in the previous step.
+        device = x.device
+        hidden_state = hidden_state.to(device)
+
         pmb_out = torch.zeros_like(x)  # Initialize with zeros to match x's shape
         
         if pmb is not None and self.config.use_pmb:
@@ -222,18 +238,21 @@ class LNNModel(PreTrainedModel):
         self.gradient_checkpointing = False
         print("  [LNNModel] Final components created.")
 
-        # Since post_init is bypassed, we manually initialize the embedding weights.
-        print("  [LNNModel] Initializing embedding weights...")
-        self.embedding.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-
-        # Manually tie the weights directly, bypassing post_init and _init_weights completely.
-        print("  [LNNModel] Manually tying output and embedding weights...")
-        self.proj_out.weight = self.embedding.weight
-        print("  [LNNModel] Weights tied successfully.")
-
+        # Finalize model initialization by letting PreTrainedModel handle weights and tying.
+        print("  [LNNModel] Calling post_init() to finalize weights and tying...")
+        self.post_init()
         print("  [LNNModel] Model initialization complete.")
  
 
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def set_input_embeddings(self, new_embeddings):
+        self.embedding = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.proj_out
 
     def _init_weights(self, module):
         """Initializes weights of the model."""
@@ -255,6 +274,8 @@ class LNNModel(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None, # Accept but ignore attention_mask
+        labels: Optional[torch.LongTensor] = None, # Accept but ignore labels
         hidden_states: Optional[List[torch.FloatTensor]] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -263,14 +284,31 @@ class LNNModel(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
 
+        # The Hugging Face Trainer, in conjunction with Accelerate and DeepSpeed,
+        # automatically places input tensors on the correct device. We can safely
+        # assume `input_ids` is on the target GPU and use its device for any
+        # new tensors created during the forward pass.
+        # The previous manual device placement logic has been removed as it was
+        # incorrectly moving data to the CPU in a ZeRO-3 setup.
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
-        
+
         # 1. Get token embeddings
+        # Ensure input tensors are on the same device as the model's weights.
+        # This is a robust way to handle device placement within the model itself,
+        # especially in complex distributed setups like DeepSpeed ZeRO-3 where
+        # the trainer might not handle it correctly for all inputs.
+        if input_ids.device != self.embedding.weight.device:
+            input_ids = input_ids.to(self.embedding.weight.device)
+
         x = self.embedding(input_ids)
+        # Move embeddings to the correct device, especially for ZeRO-3 CPU embeddings
+        x = x.to(device)
         
         # 2. Initialize hidden states if not provided
         if hidden_states is None:
+            # Initialize hidden states to zeros on the correct device.
+            # This was the final source of the CPU/GPU device mismatch errors.
             hidden_states = [
                 torch.zeros(batch_size, self.config.hidden_size, device=device)
                 for _ in range(self.config.num_hidden_layers)
@@ -341,10 +379,25 @@ class LNNModel(PreTrainedModel):
         # Calculate total load balancing loss
         total_load_balancing_loss = torch.sum(torch.stack(all_load_balancing_losses)) if all_load_balancing_losses else None
 
+        loss = None
+        if labels is not None:
+            # Standard cross-entropy loss for language modeling
+            loss_fct = nn.CrossEntropyLoss()
+            # Move labels to the same device as logits to be safe
+            labels = labels.to(logits.device)
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+            # Add the MoE load balancing loss to the total loss
+            if total_load_balancing_loss is not None:
+                loss += total_load_balancing_loss
+
         if not return_dict:
-            return (logits, last_hidden_state, tuple(all_layer_outputs) if all_layer_outputs else None, total_load_balancing_loss)
+            # For tuple output, the loss is the first element, as expected by Trainer
+            output = (logits, last_hidden_state, tuple(all_layer_outputs) if all_layer_outputs else None, total_load_balancing_loss)
+            return (loss,) + output if loss is not None else output
 
         return LNNModelOutput(
+            loss=loss,
             last_hidden_state=last_hidden_state,
             logits=logits,
             hidden_states=tuple(all_layer_outputs) if all_layer_outputs else None,
