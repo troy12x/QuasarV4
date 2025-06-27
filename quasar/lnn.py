@@ -14,6 +14,7 @@
 
 import torch
 import torch.nn as nn
+import math
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
@@ -40,8 +41,9 @@ class LNNConfig(PretrainedConfig):
         num_hidden_layers=96,  # 96 layers to keep active parameters manageable
         activation='gelu',
         lambda_res=0.0,
-        dt=1.0,
+        dt=0.1,
         initializer_range=0.02,
+        dropout=0.1,
         use_pmb=False,
         pmb_num_blocks=1024,
         pmb_slots_per_block=4096,
@@ -149,10 +151,11 @@ class LNNBlock(nn.Module):
     def __init__(self, config: LNNConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
         
         # Initialize cell and layer norm first
         self.cell = LNNCell(config)
-        self.ln_1 = nn.LayerNorm(config.hidden_size)
+        self.ln_1 = nn.LayerNorm(config.hidden_size, eps=1e-4)
         
         self.use_moe = config.use_moe
         if self.use_moe:
@@ -162,9 +165,9 @@ class LNNBlock(nn.Module):
                 expert_dim=config.expert_dim,
                 top_k=config.num_experts_per_tok
             )
-            self.ln_2 = nn.LayerNorm(config.hidden_size)
+            self.ln_2 = nn.LayerNorm(config.hidden_size, eps=1e-4)
 
-    def forward(self, x, hidden_state, pmb=None):
+    def _forward_impl(self, x, hidden_state, pmb=None):
         # --- Definitive Device Placement Fix ---
         # This is the final, robust fix for the device mismatch errors. It ensures
         # that the hidden state is on the correct GPU device at the start of every
@@ -192,17 +195,33 @@ class LNNBlock(nn.Module):
         # Recurrent part
         residual = x
         dx_dt = self.cell(hidden_state, x)
-        x = hidden_state + self.config.dt * dx_dt # Euler integration
-        x = self.ln_1(x + residual + pmb_out)
+        new_hidden_state = hidden_state + self.config.dt * dx_dt # Euler integration
+        output = self.ln_1(new_hidden_state + residual + pmb_out)
 
         # MoE part (replaces the FFN in a standard Transformer block)
         if self.use_moe:
-            residual_moe = x
-            x, load_balancing_loss = self.moe_layer(x)
-            x = self.ln_2(x + residual_moe)
-            return x, load_balancing_loss
+            residual_moe = output
+            output, load_balancing_loss = self.moe_layer(output)
+            output = self.ln_2(output + residual_moe)
+            return new_hidden_state, output, load_balancing_loss
         
-        return x, None # Return a tuple to maintain a consistent signature
+        return new_hidden_state, output, None
+
+    def forward(self, x, hidden_state, pmb=None):
+        if self.gradient_checkpointing and self.training:
+
+            def custom_forward(*inputs):
+                # pmb is from the outer scope
+                return self._forward_impl(*inputs, pmb=pmb)
+
+            return torch.utils.checkpoint.checkpoint(
+                custom_forward,
+                x,
+                hidden_state,
+                use_reentrant=False
+            )
+        else:
+            return self._forward_impl(x, hidden_state, pmb=pmb)
 
 # --- 5. Full LNN Model ---
 class LNNModel(PreTrainedModel):
@@ -233,16 +252,19 @@ class LNNModel(PreTrainedModel):
             )
         else:
             self.pmb = None
-        self.final_ln = nn.LayerNorm(config.hidden_size)
+        self.final_ln = nn.LayerNorm(config.hidden_size, eps=1e-4)
         self.proj_out = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.gradient_checkpointing = False
         print("  [LNNModel] Final components created.")
 
         # Finalize model initialization by letting PreTrainedModel handle weights and tying.
         print("  [LNNModel] Calling post_init() to finalize weights and tying...")
         self.post_init()
+
         print("  [LNNModel] Model initialization complete.")
- 
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, LNNBlock):
+            module.gradient_checkpointing = value
 
 
     def get_input_embeddings(self):
@@ -256,16 +278,22 @@ class LNNModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """Initializes weights of the model."""
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
+            if module.bias is not None:
                 module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            # Use a scaled initialization for the embedding layer, as it's tied to the
+            # output projection layer. This is critical for preventing an exploding loss.
+            std = self.config.initializer_range / math.sqrt(self.config.num_hidden_layers)
+            module.weight.data.normal_(mean=0.0, std=std)
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         elif isinstance(module, LNNCell):
             # Initialize LNNCell-specific parameters
-            nn.init.kaiming_uniform_(module.W, a=0.01)
+            # Orthogonal initialization for the recurrent weight matrix is crucial for stability.
+            nn.init.orthogonal_(module.W)
             nn.init.kaiming_uniform_(module.U, a=0.01)
             nn.init.zeros_(module.b)
             # Initialize tau to be around 1.0 after softplus
@@ -275,13 +303,15 @@ class LNNModel(PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None, # Accept but ignore attention_mask
-        labels: Optional[torch.LongTensor] = None, # Accept but ignore labels
+        labels: Optional[torch.LongTensor] = None,
         hidden_states: Optional[List[torch.FloatTensor]] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> LNNModelOutput:
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        batch_size, seq_len = input_ids.shape
+
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
 
         # The Hugging Face Trainer, in conjunction with Accelerate and DeepSpeed,
@@ -338,32 +368,23 @@ class LNNModel(PreTrainedModel):
             for i, block in enumerate(self.blocks):
                 h_current = hidden_states[i]
                 
-                if self.gradient_checkpointing and self.training:
-                    def create_custom_forward(module):
-                        def custom_forward(*inputs):
-                            return module(*inputs)
-                        return custom_forward
-
-                    layer_output, load_balancing_loss = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        layer_input,
-                        h_current,
-                        self.pmb if self.config.use_pmb else None,
-                        use_reentrant=False
-                    )
-                else:
-                    layer_output, load_balancing_loss = block(layer_input, h_current, pmb=self.pmb if self.config.use_pmb else None)
+                # The block now returns the new state for the next time step, and the output for the next layer
+                new_h, layer_output, load_balancing_loss = block(
+                    layer_input,
+                    h_current,
+                    pmb=self.pmb if self.config.use_pmb else None
+                )
                 
                 if load_balancing_loss is not None:
                     all_load_balancing_losses.append(load_balancing_loss)
 
-                next_hidden_states.append(layer_output)
-                layer_input = layer_output # Input to next layer is output of current
+                next_hidden_states.append(new_h) # Append the correct new state
+                layer_input = layer_output # The output becomes input for the next layer
 
             hidden_states = next_hidden_states
             
             # 4. Get final output from the last layer for this time step
-            final_output = hidden_states[-1]
+            final_output = layer_input # The final output is the output of the last block
             outputs_over_time.append(final_output)
 
             if output_hidden_states:
@@ -379,13 +400,18 @@ class LNNModel(PreTrainedModel):
         # Calculate total load balancing loss
         total_load_balancing_loss = torch.sum(torch.stack(all_load_balancing_losses)) if all_load_balancing_losses else None
 
+        # 7. Calculate loss if labels are provided
         loss = None
         if labels is not None:
-            # Standard cross-entropy loss for language modeling
-            loss_fct = nn.CrossEntropyLoss()
-            # Move labels to the same device as logits to be safe
-            labels = labels.to(logits.device)
-            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+            # The default HuggingFace loss calculation for causal LMs.
+            # Shift logits and labels so that tokens < n predict token n.
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            # Flatten the tokens and calculate loss, ignoring padding.
+            # This is the standard, robust way to calculate causal LM loss.
+            loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
             # Add the MoE load balancing loss to the total loss
             if total_load_balancing_loss is not None:

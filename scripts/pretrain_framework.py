@@ -6,7 +6,7 @@ import os
 import sys
 
 import torch
-from datasets import load_dataset, IterableDataset
+from datasets import Dataset, Features, Value, Sequence, load_from_disk
 from transformers import (
     Trainer,
     TrainingArguments,
@@ -15,27 +15,15 @@ from transformers import (
     AutoModelForCausalLM,
     DataCollatorForLanguageModeling,
 )
+from huggingface_hub import HfApi, hf_hub_download
+import pyarrow.parquet as pq
+from itertools import chain
 
 # Add project root to the Python path to allow importing the 'quasar' module
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from quasar.lnn import LNNModel, LNNConfig, LNNBlock
 
-def tokenize_and_pack_generator(dataset, tokenizer, sequence_length):
-    """
-    Generator function to tokenize and pack text data into fixed-length sequences.
-    This is memory-efficient for large datasets.
-    """
-    buffer = []
-    for examples in iter(dataset):
-        text = examples.get("text")
-        if not isinstance(text, str):
-            continue
-        tokenized = tokenizer(text, truncation=False, padding=False)["input_ids"]
-        buffer.extend(tokenized)
-        while len(buffer) >= sequence_length:
-            chunk = buffer[:sequence_length]
-            buffer = buffer[sequence_length:]
-            yield {"input_ids": chunk, "labels": chunk}
+
 
 def main():
     parser = argparse.ArgumentParser(description="FSDP Pre-training Framework for LNN Models")
@@ -44,15 +32,21 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save checkpoints and logs.")
 
     # --- Model Loading/Creation ---
-    parser.add_argument("--model_name_or_path", type=str, default="silx-ai/QuasarV4-8B-A3B-LNN", help="Load a pretrained model from this path. If None, create a new model.")
+    parser.add_argument("--model_name_or_path", type=str, default=None, help="Load a pretrained model. If None, creates a new model from scratch.")
     parser.add_argument("--use_moe", action="store_true", help="Enable Mixture of Experts layers when creating a new model.")
-    # Add other model config arguments if needed for 'create from scratch' mode
+    
+    # --- New Model Configuration (for 'from scratch') ---
+    parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size for a new model.")
+    parser.add_argument("--num_hidden_layers", type=int, default=12, help="Number of layers for a new model.")
+    parser.add_argument("--dt", type=float, default=0.1, help="Time step 'dt' for the LNN cells.")
 
     # --- Tokenizer and Dataset ---
-    parser.add_argument("--tokenizer_name", type=str, default="deepseek-ai/DeepSeek-V3-0324", help="Tokenizer to use.")
-    parser.add_argument("--dataset_name", type=str, default="openbmb/Ultra-FineWeb", help="Dataset to use for pre-training.")
-    parser.add_argument("--dataset_config_name", type=str, default="en", help="Dataset configuration (e.g., 'en' for English split).")
+    parser.add_argument("--tokenizer_name", type=str, default="deepseek-ai/deepseek-v2", help="Tokenizer to use.")
+    parser.add_argument("--dataset_name", type=str, required=True, help="Dataset to tokenize from the Hub.")
+    parser.add_argument("--dataset_split", type=str, required=True, help="Dataset split to use.")
+    parser.add_argument("--text_column", type=str, default="content", help="The column in the dataset containing the text.")
     parser.add_argument("--sequence_length", type=int, default=4096, help="Sequence length for packing.")
+    parser.add_argument("--num_proc", type=int, default=os.cpu_count(), help="Number of CPU processes for tokenization.")
 
     # --- Training Arguments (passed to Trainer) ---
     parser.add_argument("--batch_size", type=int, default=1, help="Per-device training batch size.")
@@ -61,6 +55,8 @@ def main():
     parser.add_argument("--max_steps", type=int, default=10000, help="Total number of training steps.")
     parser.add_argument("--logging_steps", type=int, default=10, help="Log every N steps.")
     parser.add_argument("--save_steps", type=int, default=250, help="Save a checkpoint every N steps.")
+    parser.add_argument("--bf16", action="store_true", help="Enable bfloat16 training.")
+    parser.add_argument("--wandb_project", type=str, default=None, help="Weights & Biases project name.")
 
     args = parser.parse_args()
 
@@ -69,6 +65,7 @@ def main():
     AutoConfig.register("quasar", LNNConfig)
     AutoModelForCausalLM.register(LNNConfig, LNNModel)
 
+    print(f"Loading tokenizer: {args.tokenizer_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         print("Tokenizer does not have a pad token, setting it to eos_token.")
@@ -83,12 +80,13 @@ def main():
         )
     else:
         # This block is for creating a new model from scratch.
-        # You can expand this with more arguments (hidden_size, num_layers, etc.)
         print("Creating a new LNN model from scratch...")
         config = LNNConfig(
             vocab_size=tokenizer.vocab_size,
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_hidden_layers,
+            dt=args.dt,
             use_moe=args.use_moe,
-            # ... add other config parameters here ...
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -97,15 +95,59 @@ def main():
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model initialized with {total_params:.2f}M parameters.")
 
-    # --- 2. Load and Process Dataset ---
-    print(f"Loading streaming dataset: {args.dataset_name} (Split: {args.dataset_config_name})")
-    raw_dataset = load_dataset(args.dataset_name, args.dataset_config_name, split="train", streaming=True)
-    # The dataset is huge, so we'll take a subset for demonstration purposes if needed.
-    # raw_dataset = raw_dataset.take(10000) # Uncomment to test with a smaller sample
-    train_dataset = IterableDataset.from_generator(
-        tokenize_and_pack_generator,
-        gen_kwargs={"dataset": raw_dataset, "tokenizer": tokenizer, "sequence_length": args.sequence_length},
+    # --- 2. Load, Tokenize, and Pack Dataset On-the-Fly ---
+    print("--- Starting On-the-Fly Data Processing ---")
+
+    def stream_parquet_split(repo_id, split, text_column):
+        api = HfApi()
+        repo_info = api.repo_info(repo_id, repo_type="dataset")
+        prefix = "data/"
+        files = sorted([f.rfilename for f in repo_info.siblings if f.rfilename.endswith(".parquet") and f.rfilename.startswith(prefix) and split in f.rfilename])
+        if not files: raise ValueError(f"No Parquet files found for split '{split}' in repo '{repo_id}'.")
+        print(f"Found {len(files)} Parquet files for split '{split}'.")
+        for filename in files:
+            local_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
+            table = pq.read_table(local_path, columns=[text_column])
+            for batch in table.to_batches():
+                for text in batch.to_pydict()[text_column]:
+                    if text: yield {text_column: text}
+
+    raw_features = Features({args.text_column: Value('string')})
+    raw_dataset = Dataset.from_generator(
+        lambda: stream_parquet_split(args.dataset_name, args.dataset_split, args.text_column),
+        features=raw_features
     )
+
+    def tokenize_function(examples):
+        return tokenizer(examples[args.text_column], truncation=False, padding=False)
+
+    tokenized_dataset = raw_dataset.map(
+        tokenize_function,
+        batched=True,
+        num_proc=args.num_proc,
+        remove_columns=[args.text_column]
+    )
+
+    def pack_iterator(dataset, sequence_length):
+        buffer = []
+        for example in dataset:
+            buffer.extend(example['input_ids'])
+            while len(buffer) >= sequence_length:
+                chunk = buffer[:sequence_length]
+                buffer = buffer[sequence_length:]
+                yield {"input_ids": chunk, "labels": chunk.copy()}
+
+    packed_features = Features({
+        'input_ids': Sequence(feature=Value(dtype='int64')),
+        'labels': Sequence(feature=Value(dtype='int64')),
+    })
+
+    train_dataset = Dataset.from_generator(
+        lambda: pack_iterator(tokenized_dataset, args.sequence_length),
+        features=packed_features
+    )
+    train_dataset.set_format("torch")
+    print("Dataset processed and packed successfully.")
 
     # --- 3. Configure and Start Training with FSDP ---
     # FSDP config is passed directly to TrainingArguments.
@@ -121,6 +163,10 @@ def main():
         "fsdp_use_orig_params": True, # Required for some new FSDP features and parameter tying
     }
 
+    # Set W&B project if provided
+    if args.wandb_project:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -129,22 +175,26 @@ def main():
         max_steps=args.max_steps,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        report_to="wandb",
+        report_to="wandb" if args.wandb_project else None,
         # --- FSDP & Performance ---
         fsdp="full_shard",
         fsdp_config=fsdp_config,
-        bf16=True, # Use bfloat16 for H100 performance
-        bf16_full_eval=True,
+        bf16=args.bf16,
+        bf16_full_eval=args.bf16,
         # --- Logging and Saving ---
         logging_first_step=True,
         save_strategy="steps",
         save_total_limit=3, # Keep only the last 3 checkpoints
+        dataloader_num_workers=0, # CRITICAL: Set to 0 to avoid dataloader deadlocks in FSDP
     )
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        # Although the dataset is pre-packed, using the official data collator
+        # is more robust and ensures the data is structured exactly as the Trainer
+        # expects, especially in a distributed FSDP environment.
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
     )
 
@@ -154,3 +204,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
