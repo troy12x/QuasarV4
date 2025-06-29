@@ -44,39 +44,40 @@ class TransformerModel(nn.Module):
         
         self.output_layer = nn.Linear(embedding_dim, vocab_size)
 
+        # Tie the weights of the embedding layer and the output layer
+        self.output_layer.weight = self.embedding.weight
+
         self.init_weights()
 
     def init_weights(self):
         initrange = 0.1
         self.embedding.weight.data.uniform_(-initrange, initrange)
         self.output_layer.bias.data.zero_()
-        self.output_layer.weight.data.uniform_(-initrange, initrange)
 
     def _generate_square_subsequent_mask(self, sz):
         return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
 
-    def forward(self, src):
+    def forward(self, input_ids):
         """
         Args:
-            src: Tensor, shape [batch_size, seq_len]
+            input_ids: Tensor, shape [batch_size, seq_len]
 
         Returns:
             output: Tensor, shape [batch_size, seq_len, vocab_size]
         """
         # 1. Get embeddings
-        src_emb = self.embedding(src) * math.sqrt(self.embedding_dim)
+        src_emb = self.embedding(input_ids) * math.sqrt(self.embedding_dim)
         
-        # 2. Apply positional encoding
+        # 2. Add positional encoding
         src_pos = self.pos_encoder(src_emb)
+        
+        # 3. Create causal mask
+        mask = self._generate_square_subsequent_mask(input_ids.size(1)).to(input_ids.device)
 
-        # 3. Generate causal mask for the decoder
-        mask = self._generate_square_subsequent_mask(src.size(1)).to(src.device)
-
-        # 4. Pass through the Transformer decoder
-        # For a decoder-only setup, target and memory are the same.
+        # 4. Pass through Transformer decoder
+        # The decoder is used in a self-attention manner, so tgt and memory are the same.
         output = self.transformer_decoder(tgt=src_pos, memory=src_pos, tgt_mask=mask, memory_mask=mask)
         
-        # 5. Apply the final linear layer to the entire sequence
-        output_logits = self.output_layer(output)
-        
-        return output_logits
+        # 5. Final output layer
+        output = self.output_layer(output)
+        return output

@@ -18,13 +18,11 @@ import math
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils.generic import ModelOutput
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 from .pmb import ParameterMemoryBank
 from .moe import MoELayer, Expert
-
 
 from tqdm import tqdm
 
@@ -67,8 +65,8 @@ class LNNConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.lambda_res = lambda_res
-        self.dt = dt
         self.activation = activation
+        self.dt = dt
         self.initializer_range = initializer_range
         self.use_pmb = use_pmb
         self.pmb_num_blocks = pmb_num_blocks
@@ -219,7 +217,8 @@ class LNNModel(PreTrainedModel):
         hidden_states: Optional[List[torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Processes a sequence that can contain both text and image data.
+        Processes a sequence through LNN blocks and an attention readout,
+        allowing for streaming by passing hidden states.
         """
         # 1. Get Embeddings
         x = self.embedding(input_ids)
