@@ -20,9 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_scheduler, DataCollatorForLanguageModeling
-from datasets import Dataset, Features, Value, Sequence
-from huggingface_hub import HfApi, hf_hub_download
-import pyarrow.parquet as pq
+from datasets import load_dataset, Dataset
 from itertools import chain
 
 # Local imports
@@ -103,17 +101,15 @@ def parse_args():
     parser.add_argument("--use_moe", action="store_true", help="Enable Mixture of Experts layers when creating a new model.")
 
     # --- Data Arguments ---
-    # --- Data Arguments ---
-    # The script is now designed for on-the-fly tokenization from the Hub.
-    # --tokenized_dataset_path is deprecated and has been removed.
     parser.add_argument("--dataset_name", type=str, required=True, help="Dataset to tokenize from the Hub.")
-    parser.add_argument("--dataset_split", type=str, required=True, help="Dataset split to use.")
-    parser.add_argument("--text_column", type=str, default="text", help="The column in the dataset containing the text.")
-    parser.add_argument("--sequence_length", type=int, default=4096, help="Sequence length for packing.")
+    parser.add_argument("--dataset_config_name", type=str, default=None, help="The configuration name of the dataset to use.")
+    parser.add_argument("--train_split_name", type=str, default="train", help="The name of the training data split to use.")
+    parser.add_argument("--text_column", type=str, default="text", help="The name of the column in the dataset containing the text.")
+    parser.add_argument("--sequence_length", type=int, default=2048, help="The sequence length for packing the dataset.")
 
     # --- Training & Output Arguments ---
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save checkpoints and logs.")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=8, help="Batch size per GPU.")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Batch size per GPU for training.")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="Eval batch size per GPU.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
     # Note: A cosine scheduler is often more effective for large model pre-training.
@@ -134,7 +130,7 @@ def parse_args():
     
     # Checkpointing & Logging
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from.")
-    parser.add_argument("--checkpointing_steps", type=int, default=10, help="Save checkpoint every N steps.")
+    parser.add_argument("--checkpointing_steps", type=int, default=1000, help="Save checkpoint every N steps.")
     parser.add_argument("--logging_steps", type=int, default=5, help="Log every N steps.")
     parser.add_argument("--wandb_project", type=str, default="lnn-pretraining", help="Weights & Biases project name.")
     parser.add_argument("--single_gpu", action="store_true", help="Run on a single GPU without distributed training for testing.")
@@ -189,81 +185,49 @@ def main():
 
     # --- Dataset Loading and On-the-Fly Tokenization ---
     # This section handles streaming data from the Hub, tokenizing, and packing it.
-    if not args.dataset_name or not args.dataset_split:
-        raise ValueError("Both --dataset_name and --dataset_split must be provided for on-the-fly tokenization.")
+    if not args.dataset_name or not args.train_split_name:
+        raise ValueError("Both --dataset_name and --train_split_name must be provided for on-the-fly tokenization.")
 
-    def stream_parquet_split(repo_id, split, text_column):
-        api = HfApi()
-        repo_info = api.repo_info(repo_id, repo_type="dataset")
-        # Standardized prefix for Parquet files in many datasets on the Hub
-        prefix = f"data/"
-        files = [f.rfilename for f in repo_info.siblings if f.rfilename.startswith(prefix) and f.rfilename.endswith('.parquet') and split in f.rfilename]
-        if not files:
-            # Fallback for datasets that do not use the 'data/' prefix
-            files = [f.rfilename for f in repo_info.siblings if f.rfilename.endswith('.parquet') and split in f.rfilename]
-
-        if not files:
-            raise ValueError(f"No Parquet files found for split '{split}' in repo '{repo_id}'. Check file paths and split name.")
-        
-        logger.info(f"Found {len(files)} Parquet files for split '{split}'.")
-        for filename in sorted(files):
-            try:
-                local_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
-                table = pq.read_table(local_path, columns=[text_column])
-                for batch in table.to_batches():
-                    for text in batch.to_pydict()[text_column]:
-                        if text: yield {text_column: text}
-            except Exception as e:
-                logger.warning(f"Could not process file {filename}: {e}")
-
-    if is_main_process(args.single_gpu):
-        logger.info(f"--- Starting On-the-Fly Data Processing from '{args.dataset_name}' --- ")
-
-    raw_features = Features({args.text_column: Value('string')})
-    raw_dataset = Dataset.from_generator(
-        lambda: stream_parquet_split(args.dataset_name, args.dataset_split, args.text_column),
-        features=raw_features,
-        # Caching is disabled as we are streaming. This can be enabled if disk space is not a concern.
-        cache_dir=None 
+    # Use the standard `load_dataset` with streaming mode to handle large datasets
+    # efficiently without downloading the entire dataset at once.
+    logger.info(f"Loading dataset '{args.dataset_name}' with streaming.")
+    raw_dataset = load_dataset(
+        args.dataset_name,
+        args.dataset_config_name,
+        split=args.train_split_name,
+        streaming=True
     )
+    # Rename the text column to 'text' for consistency if it's different
+    if args.text_column != 'text':
+        logger.info(f"Renaming data column '{args.text_column}' to 'text'.")
+        raw_dataset = raw_dataset.rename_column(args.text_column, 'text')
 
     def tokenize_function(examples):
         # We don't truncate or pad here; we handle fixed-size chunks in the packing step.
-        return tokenizer(examples[args.text_column], truncation=False, padding=False)
+        return tokenizer(examples['text'], truncation=False, padding=False)
 
     # Use a larger number of processes to speed up tokenization.
-    num_proc = os.cpu_count() or 1
-    logger.info(f"Tokenizing dataset with {num_proc} processes...")
+    logger.info("Tokenizing dataset...")
     tokenized_dataset = raw_dataset.map(
         tokenize_function,
         batched=True,
-        num_proc=num_proc,
-        remove_columns=[args.text_column]
+        remove_columns=['text']
     )
 
     def pack_iterator(dataset, sequence_length):
         buffer = []
         for example in dataset:
-            # Ensure 'input_ids' is a list, not a nested list
             ids = example['input_ids']
-            if ids and isinstance(ids[0], list):
-                ids = list(chain.from_iterable(ids))
             buffer.extend(ids)
             while len(buffer) >= sequence_length:
                 chunk = buffer[:sequence_length]
                 buffer = buffer[sequence_length:]
-                yield {"input_ids": chunk, "labels": chunk.copy()} # Use chunk.copy() for labels
+                yield {"input_ids": chunk, "labels": chunk.copy()}
 
-    packed_features = Features({
-        'input_ids': Sequence(feature=Value(dtype='int64')),
-        'labels': Sequence(feature=Value(dtype='int64')),
-    })
-
-    # Create the final packed dataset for training
-    train_dataset = Dataset.from_generator(
-        lambda: pack_iterator(tokenized_dataset, args.sequence_length),
-        features=packed_features
+    packed_dataset = Dataset.from_generator(
+        lambda: pack_iterator(tokenized_dataset, args.sequence_length)
     )
+    train_dataset = packed_dataset
     train_dataset.set_format("torch")
     logger.info("Dataset processed and packed successfully.")
 
@@ -404,10 +368,12 @@ def main():
             if completed_steps >= args.max_train_steps:
                 break
 
+            # Move batch to device and separate labels
+            labels = batch.pop("labels", None).to(device)
             batch = {k: v.to(device) for k, v in batch.items()}
-            
+
             with torch.amp.autocast(device_type='cuda', dtype=autocast_dtype):
-                outputs = model(**batch)
+                outputs = model(**batch, labels=labels)
                 loss = outputs.loss
             
             # Scale the loss for mixed precision and perform the backward pass

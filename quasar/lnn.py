@@ -216,23 +216,28 @@ class LNNModel(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        hidden_states: Optional[List[torch.Tensor]] = None
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        labels: Optional[torch.LongTensor] = None,
+        hidden_states: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,  # Accept attention_mask
+        **kwargs,  # Accept other arguments
+    ) -> LNNModelOutput:
         """
-        Processes a sequence that can contain both text and image data.
+        Processes a sequence, calculates loss, and handles unexpected arguments.
+        The `attention_mask` is accepted but not used, as the LNN processes
+        the sequence recurrently.
         """
         # 1. Get Embeddings
         x = self.embedding(input_ids)
         batch_size = input_ids.shape[0]
 
-        # 2. Initialize hidden states if not provided (for the first chunk)
+        # 2. Initialize hidden states if not provided
         if hidden_states is None:
             hidden_states = [
                 torch.zeros(batch_size, self.config.hidden_size, device=x.device)
                 for _ in range(self.config.num_hidden_layers)
             ]
 
-        # 3. Process sequence through LNN blocks, layer by layer
+        # 3. Process sequence through LNN blocks
         new_hidden_states = []
         layer_output = x
         for i, block in enumerate(self.blocks):
@@ -245,4 +250,15 @@ class LNNModel(PreTrainedModel):
         readout_output = self.ln_final(readout_output)
         logits = self.proj_out(readout_output)
 
-        return (logits, new_hidden_states)
+        # 5. Calculate loss if labels are provided
+        loss = None
+        if labels is not None:
+            # Flatten the tokens and compute loss
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        return LNNModelOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=tuple(new_hidden_states),
+        )
