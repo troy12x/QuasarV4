@@ -56,6 +56,7 @@ def main(args):
     words = train_text.split()
     word_counts = Counter(words)
     vocab = sorted(word_counts, key=word_counts.get, reverse=True)
+    vocab = vocab[:499] # Limit vocab size to 499 + <unk> = 500
     vocab.insert(0, '<unk>') # Add an unknown token
     vocab_size = len(vocab)
     print(f"Vocabulary size: {vocab_size}")
@@ -95,6 +96,12 @@ def main(args):
     quasar_lnn = LNNModel(lnn_config).to(device)
 
     print(f"Quasar LNN Initialized. Trainable Parameters: {count_parameters(quasar_lnn)}")
+
+    print("\n--- Model Parameters ---")
+    for name, param in quasar_lnn.named_parameters():
+        if param.requires_grad:
+            print(f"Layer: {name} | Size: {param.size()} | Num Parameters: {param.numel()}")
+    print("------------------------\n")
 
     # --- Training Setup ---
     loss_fn = torch.nn.CrossEntropyLoss()
@@ -146,8 +153,8 @@ if __name__ == "__main__":
     parser.add_argument("--sequence_length", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=16)
     # LNN args
-    parser.add_argument("--hidden_size", type=int, default=256) # Increased hidden size for more capacity
-    parser.add_argument("--lnn_num_layers", type=int, default=4)   # Deeper LNN
+    parser.add_argument("--hidden_size", type=int, default=32) # Reduced for lower params
+    parser.add_argument("--lnn_num_layers", type=int, default=2)   # Reduced for lower params
     parser.add_argument("--num_epochs", type=int, default=2)   # More epochs for real data
     parser.add_argument("--lr_lnn", type=float, default=1e-3)
     # Upload args

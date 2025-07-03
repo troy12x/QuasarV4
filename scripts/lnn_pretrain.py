@@ -95,10 +95,12 @@ def parse_args():
     parser.add_argument("--use_slow_tokenizer", action="store_true", help="Use slow tokenizer.")
 
     # --- Arguments for Creating a New Model ---
-    parser.add_argument("--hidden_size", type=int, default=1536, help="Hidden size for new models.")
-    parser.add_argument("--num_hidden_layers", type=int, default=10, help="Number of hidden layers for new models.")
+    parser.add_argument("--hidden_size", type=int, default=8192, help="Hidden size for new models.")
+    parser.add_argument("--num_hidden_layers", type=int, default=12, help="Number of hidden layers for new models.")
     parser.add_argument("--dt", type=float, default=0.1, help="Integration step size (dt) for the LNN cells.")
     parser.add_argument("--use_moe", action="store_true", help="Enable Mixture of Experts layers when creating a new model.")
+    parser.add_argument("--num_experts", type=int, default=14, help="Number of experts for MoE layers.")
+    parser.add_argument("--num_experts_per_tok", type=int, default=2, help="Number of experts to use per token for MoE layers.")
 
     # --- Data Arguments ---
     parser.add_argument("--dataset_name", type=str, required=True, help="Dataset to tokenize from the Hub.")
@@ -262,6 +264,8 @@ def main():
             num_hidden_layers=args.num_hidden_layers,
             dt=args.dt,
             use_moe=args.use_moe,
+            num_experts=args.num_experts,
+            num_experts_per_tok=args.num_experts_per_tok,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
