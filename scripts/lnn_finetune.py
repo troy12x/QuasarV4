@@ -134,45 +134,33 @@ def setup_logging(single_gpu_mode=False):
 
 # --- Argument Parsing ---
 def parse_args():
-    parser = argparse.ArgumentParser(description="Large-scale pre-training script for LNN")
+    parser = argparse.ArgumentParser(description="Fine-tuning script for LNN models.")
     
     # --- Model & Tokenizer Arguments ---
-    parser.add_argument("--model_name_or_path", type=str, default=None, help="Load a pretrained LNN model. If None, create a new model from scratch.")
-    parser.add_argument("--tokenizer_name", type=str, default="deepseek-ai/DeepSeek-V3", help="Tokenizer name or path.")
-
-    # --- Arguments for Creating a New Model ---
-    parser.add_argument("--hidden_size", type=int, default=3048, help="Hidden size for new models.")
-    parser.add_argument("--num_hidden_layers", type=int, default=6, help="Number of hidden layers for new models.")
-    parser.add_argument("--dt", type=float, default=0.1, help="Integration step size (dt) for the LNN cells.")
-    parser.add_argument("--use_moe", action="store_true", help="Enable Mixture of Experts layers when creating a new model.")
-    parser.add_argument("--num_experts", type=int, default=14, help="Number of experts for MoE layers.")
-    parser.add_argument("--num_experts_per_tok", type=int, default=2, help="Number of experts to use per token for MoE layers.")
+    parser.add_argument("--model_name_or_path", type=str, required=True, help="Path to the pretrained LNN model to fine-tune (e.g., 'silx-ai/QuasarV4-LNN-Tiny').")
+    parser.add_argument("--tokenizer_name", type=str, default=None, help="Tokenizer name or path. If None, it will be loaded from the model path.")
 
     # --- Data Arguments ---
-    parser.add_argument("--dataset_name", type=str, required=True, help="Dataset to tokenize from the Hub.")
+    parser.add_argument("--dataset_name", type=str, default="HuggingFaceTB/smol-smoltalk", help="Dataset to use for fine-tuning.")
     parser.add_argument("--dataset_config_name", type=str, default=None, help="The configuration name of the dataset to use.")
     parser.add_argument("--train_split_name", type=str, default="train", help="The name of the training data split to use.")
     parser.add_argument("--validation_split_name", type=str, default="validation", help="The name of the validation data split to use.")
-    parser.add_argument("--validation_split_percentage", type=float, default=0.1, help="Percentage of training data to use for validation if validation split doesn't exist (e.g., 0.1 for 0.1%%).")
+    parser.add_argument("--validation_split_percentage", type=float, default=5.0, help="Percentage of training data to use for validation if validation split doesn't exist (e.g., 5.0 for 5%%).")
     parser.add_argument("--text_column", type=str, default="text", help="The name of the column in the dataset containing the text.")
-    parser.add_argument("--sequence_length", type=int, default=2048, help="The sequence length for packing the dataset.")
+    parser.add_argument("--sequence_length", type=int, default=512, help="The sequence length for packing the dataset. Adjust based on your VRAM.")
 
     # --- Training & Output Arguments ---
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save checkpoints and logs.")
     parser.add_argument("--per_device_train_batch_size", type=int, default=8, help="Batch size per GPU for training.")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="Eval batch size per GPU.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
-    # Note: A cosine scheduler is often more effective for large model pre-training.
-    # It helps in achieving a lower loss by annealing the learning rate smoothly.
-    # The learning rate and Adam betas have been adjusted for more stable training to prevent NaN loss.
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Initial learning rate. Lowered for stability.")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Initial learning rate for fine-tuning.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
-    parser.add_argument("--adam_betas", type=float, nargs=2, default=[0.9, 0.999], help="Beta values for AdamW optimizer. Beta2 increased for stability.")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform. For large datasets, --max_train_steps is recommended.")
+    parser.add_argument("--adam_betas", type=float, nargs=2, default=[0.9, 0.999], help="Beta values for AdamW optimizer.")
+    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
     parser.add_argument("--max_train_steps", type=int, default=None, help="Total number of training steps. If provided, this overrides num_train_epochs.")
-    # Using a cosine scheduler with a longer warmup is a common best practice for pre-training.
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="LR scheduler type (e.g., 'linear', 'cosine').")
-    parser.add_argument("--warmup_ratio", type=float, default=0.02, help="Ratio of total training steps for linear warmup. Is ignored if --num_warmup_steps is set.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.03, help="Ratio of total training steps for linear warmup. Is ignored if --num_warmup_steps is set.")
     parser.add_argument("--num_warmup_steps", type=int, default=None, help="Number of steps for linear warmup. Overrides warmup_ratio.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping max norm.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -181,24 +169,27 @@ def parse_args():
     
     # Checkpointing & Logging
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from.")
-    parser.add_argument("--checkpointing_steps", type=int, default=1000, help="Save checkpoint every N steps.")
+    parser.add_argument("--checkpointing_steps", type=int, default=500, help="Save checkpoint every N steps. More frequent for fine-tuning.")
     parser.add_argument("--max_checkpoints_to_keep", type=int, default=3, help="The maximum number of recent checkpoints to keep.")
-    parser.add_argument("--eval_steps", type=int, default=1000, help="Run evaluation every N steps.")
-    parser.add_argument("--logging_steps", type=int, default=5, help="Log every N steps.")
-    parser.add_argument("--wandb_project", type=str, default="lnn-pretraining", help="Weights & Biases project name.")
+    parser.add_argument("--eval_steps", type=int, default=500, help="Run evaluation every N steps.")
+    parser.add_argument("--logging_steps", type=int, default=10, help="Log every N steps.")
+    parser.add_argument("--wandb_project", type=str, default="lnn-finetuning", help="Weights & Biases project name.")
     parser.add_argument("--single_gpu", action="store_true", help="Run on a single GPU without distributed training for testing.")
     parser.add_argument("--ddp_timeout", type=int, default=300, help="Timeout in seconds for DDP initialization.")
     parser.add_argument("--overwrite_cache", action="store_true", help="Overwrite the cached tokenized dataset if it exists.")
     parser.add_argument("--data_cache_dir", type=str, default="./cached_data", help="Directory to cache the processed dataset.")
-    parser.add_argument("--num_proc", type=int, default=128, help="Number of processes for dataset processing. Reduce if you encounter out-of-memory errors.")
+    parser.add_argument("--num_proc", type=int, default=None, help="Number of processes for dataset processing. Defaults to number of CPUs.")
 
     # Hub arguments
-    parser.add_argument("--push_to_hub", action="store_true", help="Push checkpoints to the Hugging Face Hub.")
-    parser.add_argument("--hub_model_id", type=str, default=None, help="The model ID (repository name) on the Hugging Face Hub.")
+    parser.add_argument("--push_to_hub", action="store_true", help="Push final model to the Hugging Face Hub.")
+    parser.add_argument("--hub_model_id", type=str, default=None, help="The model ID (repository name) on the Hugging Face Hub for the fine-tuned model.")
     parser.add_argument("--hub_private_repo", action="store_true", help="Create a private repository on the Hub.")
     parser.add_argument("--debug_nan", action="store_true", help="Enable anomaly detection for debugging NaN loss.")
 
     args, _ = parser.parse_known_args()
+    if args.num_proc is None:
+        args.num_proc = os.cpu_count()
+        
     return args
 
 # --- Evaluation Function ---
@@ -261,9 +252,10 @@ def main():
     if is_main_process(args.single_gpu):
         os.makedirs(args.output_dir, exist_ok=True)
         wandb.init(project=args.wandb_project, config=args)
-
-    logger.info(f"Loading tokenizer: {args.tokenizer_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+    
+    tokenizer_load_path = args.tokenizer_name if args.tokenizer_name else args.model_name_or_path
+    logger.info(f"Loading tokenizer from: {tokenizer_load_path}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_load_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -278,12 +270,11 @@ def main():
             logger.warning(f"Could not determine dataset splits from Hub. Will attempt to load and then split if needed.")
             needs_split = True  # Assume split is needed if we can't check, will verify after loading.
 
-        # Create a unique path for the cached dataset. If we split, add the percentage to the name
-        # to avoid using a stale cache if the percentage changes.
+        # Create a unique path for the cached dataset.
         dataset_identifier = args.dataset_name.replace("/", "_")
         if args.dataset_config_name:
             dataset_identifier += f"_{args.dataset_config_name}"
-        tokenizer_identifier = args.tokenizer_name.replace("/", "_")
+        tokenizer_identifier = tokenizer_load_path.replace("/", "_")
         
         cache_name_base = f"{dataset_identifier}_{tokenizer_identifier}_seqlen{args.sequence_length}"
         if needs_split:
@@ -300,19 +291,92 @@ def main():
             logger.info(f"Loading processed dataset from cache: {cached_dataset_path}")
             train_dataset = Dataset.load_from_disk(cached_dataset_path)
         else:
-            # If the directory exists but is invalid, clean it up before reprocessing.
-            if not args.overwrite_cache and os.path.exists(cached_dataset_path):
-                logger.warning(f"Found an incomplete cache at {cached_dataset_path}. Deleting and reprocessing.")
-                if is_main_process(args.single_gpu):
-                    shutil.rmtree(cached_dataset_path)
-                    # Also remove the corresponding eval cache if it exists
-                    eval_cache_path = cached_dataset_path + "_eval"
-                    if os.path.exists(eval_cache_path):
-                        shutil.rmtree(eval_cache_path)
+            if os.path.exists(cached_dataset_path) and is_main_process(args.single_gpu):
+                logger.warning(f"Found an incomplete or outdated cache at {cached_dataset_path}. Deleting and reprocessing.")
+                shutil.rmtree(cached_dataset_path)
+                eval_cache_path = cached_dataset_path + "_eval"
+                if os.path.exists(eval_cache_path):
+                    shutil.rmtree(eval_cache_path)
 
             logger.info("Cache not found or invalid. Processing dataset from scratch.")
             raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name, streaming=False)
 
+            # --- ShareGPT Data Processing ---
+            # This section is modified to handle conversational formats like ShareGPT.
+            # It formats each conversation using the tokenizer's chat template,
+            # then tokenizes it and masks the user's prompts in the labels.
+            def process_conversations(examples):
+                # The 'conversations' column in smol-smoltalk holds the list of turns.
+                # We will format this into a single sequence for the model.
+                outputs = {'input_ids': [], 'labels': [], 'attention_mask': []}
+
+                for conversation in examples["conversations"]:
+                    # Apply the chat template to the entire conversation.
+                    # This adds the special tokens (e.g., for user, assistant) needed by the model.
+                    full_tokenized = tokenizer.apply_chat_template(
+                        conversation, 
+                        truncation=True, 
+                        max_length=args.sequence_length, 
+                        padding=False, # Data collator will handle padding
+                        return_tensors=None # Return list of ints
+                    )
+                    
+                    if not full_tokenized:
+                        continue # Skip empty or invalid conversations
+
+                    # Create labels by cloning input_ids. We will then mask out the prompt sections.
+                    labels = list(full_tokenized)
+                    
+                    # Find all instances of the assistant's turn to mask the prompts correctly.
+                    # We find the start of each assistant message and mask everything before it.
+                    # This ensures we only calculate loss on the assistant's responses.
+                    assistant_turn_starts = []
+                    for i in range(len(conversation) - 1):
+                        if conversation[i]['role'] == 'user' and conversation[i+1]['role'] == 'assistant':
+                            # Get the template up to the point *before* the assistant speaks
+                            prompt_template = tokenizer.apply_chat_template(
+                                conversation[:i+1], 
+                                add_generation_prompt=True, # This adds the prompt for the assistant to start
+                                tokenize=False
+                            )
+                            # Find where this prompt ends in the tokenized output
+                            prompt_end_index = len(tokenizer.encode(prompt_template, add_special_tokens=False))
+                            assistant_turn_starts.append(prompt_end_index)
+                    
+                    # Mask all tokens that are part of the prompt (i.e., not the assistant's response)
+                    # We iterate backwards to handle multiple turns in a single conversation correctly.
+                    # Start with a fully unmasked sequence of labels
+                    is_response_part = [True] * len(labels)
+                    
+                    # For each turn, we mask everything *up to* the assistant's part
+                    current_mask_end = len(labels)
+                    for start_index in reversed(assistant_turn_starts):
+                        if start_index < current_mask_end:
+                            for i in range(start_index):
+                                is_response_part[i] = False # Mask prompt tokens
+                        current_mask_end = start_index
+
+                    # Apply the mask to the labels. Unmasked tokens are model's responses.
+                    for i in range(len(labels)):
+                        if not is_response_part[i]:
+                            labels[i] = -100
+
+                    # A final check: if no part of the conversation is a response, skip it.
+                    if all(label == -100 for label in labels):
+                        continue
+                            
+                    outputs['input_ids'].append(full_tokenized)
+                    outputs['labels'].append(labels)
+                    outputs['attention_mask'].append([1] * len(full_tokenized))
+
+                return outputs
+
+            logger.info("Processing conversations with ShareGPT format...")
+            
+            # Ensure the correct column name is used
+            column_names = list(raw_datasets.values())[0].column_names
+            dataset_column = "message" if "messages" in column_names else args.text_column
+            
             train_raw_dataset = raw_datasets.get(args.train_split_name)
             eval_raw_dataset = raw_datasets.get(args.validation_split_name)
 
@@ -332,34 +396,13 @@ def main():
                 eval_raw_dataset = split_dataset['test']
                 logger.info(f"Created validation split with {len(eval_raw_dataset)} samples. New training set size: {len(train_raw_dataset)}.")
 
-            if args.text_column != 'text':
-                train_raw_dataset = train_raw_dataset.rename_column(args.text_column, 'text')
-                if eval_raw_dataset:
-                    eval_raw_dataset = eval_raw_dataset.rename_column(args.text_column, 'text')
-
-            def tokenize_function(examples):
-                return tokenizer(examples['text'], truncation=False, padding=False)
-
-            logger.info("Tokenizing training data...")
-            tokenized_dataset = train_raw_dataset.map(
-                tokenize_function, batched=True, num_proc=args.num_proc, remove_columns=train_raw_dataset.column_names
-            )
-
-            def group_texts(examples):
-                concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-                total_length = len(concatenated_examples[list(examples.keys())[0]])
-                if total_length >= args.sequence_length:
-                    total_length = (total_length // args.sequence_length) * args.sequence_length
-                result = {
-                    k: [t[i : i + args.sequence_length] for i in range(0, total_length, args.sequence_length)]
-                    for k, t in concatenated_examples.items()
-                }
-                result["labels"] = result["input_ids"].copy()
-                return result
-
-            logger.info("Grouping texts for training set...")
-            train_dataset = tokenized_dataset.map(
-                group_texts, batched=True, num_proc=args.num_proc
+            logger.info("Applying chat template to training data...")
+            train_dataset = train_raw_dataset.map(
+                process_conversations,
+                batched=True,
+                num_proc=args.num_proc,
+                remove_columns=train_raw_dataset.column_names,
+                desc="Formatting training data"
             )
             
             if is_main_process(args.single_gpu):
@@ -369,12 +412,13 @@ def main():
             # Process and cache validation dataset
             if eval_raw_dataset:
                 cached_eval_dataset_path = cached_dataset_path + "_eval"
-                logger.info("Processing validation dataset.")
-                eval_tokenized_dataset = eval_raw_dataset.map(
-                    tokenize_function, batched=True, num_proc=args.num_proc, remove_columns=eval_raw_dataset.column_names
-                )
-                eval_dataset = eval_tokenized_dataset.map(
-                    group_texts, batched=True, num_proc=args.num_proc
+                logger.info("Applying chat template to validation data...")
+                eval_dataset = eval_raw_dataset.map(
+                    process_conversations,
+                    batched=True,
+                    num_proc=args.num_proc,
+                    remove_columns=eval_raw_dataset.column_names,
+                    desc="Formatting validation data"
                 )
                 if is_main_process(args.single_gpu):
                     logger.info(f"Saving processed validation dataset to cache: {cached_eval_dataset_path}")
@@ -402,32 +446,14 @@ def main():
             eval_dataset, batch_size=args.per_device_eval_batch_size, sampler=eval_sampler, collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False), pin_memory=True, drop_last=True
         )
 
-    logger.info("Initializing model...")
-    if args.model_name_or_path:
-        logger.info(f"Loading pretrained LNN model from: {args.model_name_or_path}")
-        model = LNNModel.from_pretrained(args.model_name_or_path)
-    else:
-        logger.info(f"Creating a new LNN model from scratch with hidden_size={args.hidden_size} and num_layers={args.num_hidden_layers}")
-        config = LNNConfig(
-            vocab_size=len(tokenizer),
-            hidden_size=args.hidden_size,
-            num_hidden_layers=args.num_hidden_layers,
-            dt=args.dt,
-            use_moe=args.use_moe,
-            num_experts=args.num_experts,
-            num_experts_per_tok=args.num_experts_per_tok,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-        model = LNNModel(config)
+    logger.info(f"Initializing model from: {args.model_name_or_path}")
+    model = LNNModel.from_pretrained(args.model_name_or_path)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
     model = model.to(device)
     if not args.single_gpu:
-        # Since MoE layers are not used by default and the architecture is static,
-        # we can set find_unused_parameters=False for a performance gain.
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # Enable anomaly detection if the debug flag is set
@@ -447,10 +473,9 @@ def main():
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     else:
-        # If max_train_steps is set, calculate the number of epochs for logging purposes.
         args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # Calculate warmup steps. Priority is given to the explicit num_warmup_steps argument.
+    # Calculate warmup steps.
     if args.num_warmup_steps is None:
         args.num_warmup_steps = int(args.max_train_steps * args.warmup_ratio)
         logger.info(f"Calculated warmup steps from ratio: {args.num_warmup_steps}")
@@ -476,12 +501,10 @@ def main():
         training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
         if os.path.exists(training_state_path):
             logger.info(f"Found full training state at {training_state_path}. Loading...")
-            # weights_only=False is critical to load optimizer/scheduler
             checkpoint = torch.load(training_state_path, map_location=device, weights_only=False)
             
             model_to_load = model.module if not args.single_gpu else model
-            # Use strict=False to allow loading from a checkpoint that has more keys (e.g., from the old readout layer)
-            model_to_load.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            model_to_load.load_state_dict(checkpoint['model_state_dict'], strict=True)
             
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -491,20 +514,10 @@ def main():
             tokens_processed = checkpoint.get('tokens_processed', 0)
             logger.info(f"Successfully resumed from epoch {start_epoch}, global step {global_step}. LR is {lr_scheduler.get_last_lr()[0]:.2e}")
         else:
-            logger.warning(f"'training_state.pt' not found. Attempting to load model weights from 'pytorch_model.bin'.")
-            weights_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
-            if os.path.exists(weights_path):
-                model_to_load = model.module if not args.single_gpu else model
-                # weights_only=True is safer as we only expect model weights here.
-                state_dict = torch.load(weights_path, map_location=device, weights_only=True)
-                # Use strict=False to allow loading from a checkpoint that has more keys
-                model_to_load.load_state_dict(state_dict, strict=False)
-                logger.info(f"Successfully loaded model weights from {weights_path}. Optimizer and scheduler are not restored.")
-            else:
-                logger.error(f"FATAL: Could not find 'training_state.pt' or 'pytorch_model.bin' in {checkpoint_dir}. Cannot resume training.")
-                sys.exit(1) # Exit because we cannot fulfill the resume request.
+            logger.error(f"FATAL: Could not find 'training_state.pt' in {checkpoint_dir}. Cannot resume training.")
+            sys.exit(1) # Exit because we cannot fulfill the resume request.
 
-    logger.info("***** Starting Training *****")
+    logger.info("***** Starting Fine-Tuning *****")
     logger.info(f"  Total train batch size = {args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
@@ -515,25 +528,19 @@ def main():
     model.train()
 
     if is_main_process(args.single_gpu):
-        progress_bar = tqdm(initial=completed_steps, total=args.max_train_steps, desc="Training Progress")
+        progress_bar = tqdm(initial=completed_steps, total=args.max_train_steps, desc="Fine-Tuning Progress")
 
-    # The outer loop is for epochs, but we break once max_train_steps is reached.
     for epoch in range(start_epoch, args.num_train_epochs):
         if not args.single_gpu:
             train_sampler.set_epoch(epoch)
 
         for step, batch in enumerate(train_dataloader):
-            # If we've reached the max steps, break out of the inner loop
             if completed_steps >= args.max_train_steps:
                 break
 
-            # Move batch to device and separate labels
             labels = batch.pop("labels").to(device)
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # --- Token Counting ---
-            # We do this for every batch, regardless of gradient accumulation
-            # batch['input_ids'].numel() gives batch_size * sequence_length
             batch_tokens = batch['input_ids'].numel() * world_size
             tokens_processed += batch_tokens
 
@@ -541,18 +548,14 @@ def main():
                 outputs = model(**batch, labels=labels)
                 loss = outputs.loss
 
-
-            # Scale the loss for mixed precision and perform the backward pass
             scaler.scale(loss / args.gradient_accumulation_steps).backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader):
-                # Unscale gradients before clipping
                 scaler.unscale_(optimizer)
                 
                 if args.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-                # Scaler-aware optimizer step
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -560,8 +563,6 @@ def main():
                 lr_scheduler.step()
                 completed_steps += 1
 
-                # --- Logging and Checkpointing ---
-                # These actions happen only on an optimization step
                 if is_main_process(args.single_gpu):
                     current_loss = loss.item()
                     progress_bar.update(1)
@@ -579,20 +580,16 @@ def main():
                 if completed_steps > 0 and completed_steps % args.checkpointing_steps == 0 and is_main_process(args.single_gpu):
                     save_checkpoint(model, optimizer, lr_scheduler, tokenizer, args, completed_steps, epoch, tokens_processed)
 
-                # --- Evaluation ---
-                # All processes must participate in evaluation to avoid deadlocks.
                 if eval_dataloader and completed_steps > 0 and completed_steps % args.eval_steps == 0:
                     if is_main_process(args.single_gpu):
                         logger.info(f"--- Starting evaluation at step {completed_steps} ---")
                     
                     eval_loss = evaluate(model, eval_dataloader, device, autocast_dtype, args)
                     
-                    # Log only on the main process
                     if is_main_process(args.single_gpu):
                         logger.info(f"--- Evaluation finished. Eval loss: {eval_loss:.4f} ---")
                         wandb.log({"eval/loss": eval_loss}, step=completed_steps)
 
-        # If we've reached the max steps, break out of the outer loop
         if completed_steps >= args.max_train_steps:
             break
 
@@ -601,20 +598,21 @@ def main():
 
     # --- Final Model Saving ---
     if is_main_process(args.single_gpu):
-        logger.info("Training complete. Saving final model.")
+        logger.info("Fine-tuning complete. Saving final model.")
         final_checkpoint_dir = os.path.join(args.output_dir, "final_checkpoint")
         
         model_to_save = model.module if hasattr(model, 'module') else model
 
-        # Save locally
         model_to_save.save_pretrained(final_checkpoint_dir, safe_serialization=False)
         tokenizer.save_pretrained(final_checkpoint_dir)
         logger.info(f"Final model saved locally to {final_checkpoint_dir}")
 
-        # Push to hub if requested
         if args.push_to_hub and args.hub_model_id:
             logger.info(f"Pushing final model to Hub repository: {args.hub_model_id}")
             try:
+                # Create the repo if it doesn't exist
+                create_repo(args.hub_model_id, private=args.hub_private_repo, exist_ok=True)
+                # Push the model and tokenizer
                 model_to_save.push_to_hub(args.hub_model_id, private=args.hub_private_repo, safe_serialization=False)
                 tokenizer.push_to_hub(args.hub_model_id, private=args.hub_private_repo)
                 logger.info(f"Successfully pushed to {args.hub_model_id}")
@@ -628,4 +626,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 

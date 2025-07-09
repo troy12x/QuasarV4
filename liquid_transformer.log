@@ -1,0 +1,68 @@
+2025-07-07T01:49:52.199295+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:49:52.203310+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:49:52.204311+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:49:52.205310+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:50:44.666326+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:50:44.670830+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:50:44.672340+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:50:44.674346+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:52:00.119334+0300 DEBUG Input shape to TransformerLayerWithLiquid: torch.Size([1, 16, 32, 128])
+2025-07-07T01:56:36.913843+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:56:36.918411+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:56:36.919415+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:56:36.921922+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:57:46.893723+0300 DEBUG Input shape to TransformerLayerWithLiquid: torch.Size([1, 16, 32, 128])
+2025-07-07T01:57:46.918767+0300 DEBUG Input shape: torch.Size([16, 32, 128]), Hidden state shape: torch.Size([16, 128])
+2025-07-07T01:59:11.309603+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:59:11.312617+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:59:11.314622+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:59:11.316621+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T01:59:11.417207+0300 DEBUG Input shape to TransformerLayerWithLiquid: torch.Size([1, 16, 32, 128])
+2025-07-07T01:59:11.526610+0300 DEBUG Input shape: torch.Size([16, 128]), Hidden state shape: torch.Size([16, 128])
+2025-07-07T01:59:11.547683+0300 DEBUG Updated hidden state shape: torch.Size([16, 128])
+2025-07-07T01:59:11.547683+0300 DEBUG Hidden state shape after liquid cell: torch.Size([16, 128])
+2025-07-07T01:59:11.717319+0300 DEBUG Gate outputs: tensor([[0.4693, 0.5307],
+        [0.4173, 0.5827],
+        [0.5317, 0.4683],
+        [0.3962, 0.6038],
+        [0.4297, 0.5703],
+        [0.5389, 0.4611],
+        [0.5043, 0.4957],
+        [0.5488, 0.4512],
+        [0.3275, 0.6725],
+        [0.4719, 0.5281],
+        [0.5159, 0.4841],
+        [0.5627, 0.4373],
+        [0.6381, 0.3619],
+        [0.5011, 0.4989],
+        [0.5679, 0.4321],
+        [0.2156, 0.7844]], device='cuda:0', grad_fn=<SoftmaxBackward0>)
+2025-07-07T01:59:11.732645+0300 DEBUG Expert outputs: tensor([[[ 0.4009,  0.2921,  0.4535,  ...,  0.4858,  0.1418,  0.4793],
+         [-0.6628,  0.8734,  0.5877,  ...,  0.3569,  0.5543,  0.6962]],
+
+        [[ 0.1120,  0.6408,  0.2802,  ...,  0.2236,  0.3778,  0.3857],
+         [-0.4388,  0.2412,  0.3977,  ...,  0.5780,  1.6955,  0.6500]],
+
+        [[ 0.0503,  0.3104,  0.1982,  ...,  0.6711, -0.0679,  0.3380],
+         [-0.1765,  0.2328,  0.1177,  ...,  0.2885,  1.0670,  0.6653]],
+
+        ...,
+
+        [[ 0.0684,  0.3115, -0.0999,  ...,  0.6500, -0.0138,  0.3004],
+         [-0.6474,  0.0930,  0.0885,  ...,  0.1582,  1.0753,  0.6904]],
+
+        [[ 0.1955,  0.1804,  0.1989,  ...,  0.1901, -0.2271,  0.3177],
+         [-0.0502,  0.5835,  0.2013,  ...,  0.2132,  0.3975,  0.6414]],
+
+        [[ 0.3999,  0.0181, -0.3830,  ...,  0.6749,  0.3708,  0.2575],
+         [-0.9740,  0.8748,  1.1410,  ...,  0.9202,  0.6885,  0.7923]]],
+       device='cuda:0', grad_fn=<StackBackward0>)
+2025-07-07T01:59:11.746759+0300 DEBUG MoE output shape: torch.Size([16, 128])
+2025-07-07T02:00:50.823168+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T02:00:50.826422+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T02:00:50.828428+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T02:00:50.829428+0300 INFO Initialized LiquidCell with input_size=128, hidden_size=128, dropout=0.1
+2025-07-07T02:00:50.903905+0300 DEBUG Input shape to TransformerLayerWithLiquid: torch.Size([1, 16, 32, 128])
+2025-07-07T02:00:51.001954+0300 DEBUG Input shape: torch.Size([16, 128]), Hidden state shape: torch.Size([16, 128])
+2025-07-07T02:00:51.008459+0300 DEBUG Updated hidden state shape: torch.Size([16, 128])
+2025-07-07T02:00:51.008459+0300 DEBUG Hidden state shape after liquid cell: torch.Size([16, 128])

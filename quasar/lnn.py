@@ -126,7 +126,9 @@ class LNNCell(nn.Module):
         """Core ODE dynamics calculation for a single discrete step."""
         # 1. Compute Input-Dependent Time Constant (tau)
         tau_control = self.tau_w_h(h) + self.tau_w_u(u) + self.tau_b
-        tau_positive = F.softplus(tau_control) + 0.01 # Add a floor for stability
+        # Increased the floor from 0.01 to 1.0 to prevent division by a near-zero
+        # number, which is a common cause of NaN in bf16.
+        tau_positive = F.softplus(tau_control) + 1.0
 
         # 2. Compute State Update
         decay_term = -h / tau_positive
@@ -165,6 +167,9 @@ class LNNBlock(nn.Module):
             u = x[:, t, :]
             dx_dt = self.cell(h, u)
             h = h + self.dt * dx_dt
+            # Clamp the hidden state to prevent runaway values, a common
+            # source of instability in recurrent models.
+            h = torch.clamp(h, -100, 100)
             outputs[:, t, :] = h
 
         # Add residual connection and layer norm
@@ -189,21 +194,16 @@ class LNNModel(PreTrainedModel):
         self.blocks = nn.ModuleList([LNNBlock(config) for _ in range(config.num_hidden_layers)])
         
         # JIT-compile the LNNBlocks for a significant performance boost
-        for i in range(len(self.blocks)):
-            self.blocks[i] = torch.jit.script(self.blocks[i])
+        # Disabling JIT as a test, as it can sometimes cause unexpected memory allocation issues with recurrent loops.
+        # for i in range(len(self.blocks)):
+        #     self.blocks[i] = torch.jit.script(self.blocks[i])
 
         self.ln_final = nn.LayerNorm(config.hidden_size, eps=1e-5)
         
-        # Restore the attention-based readout
-        self.readout = nn.TransformerEncoderLayer(
-            d_model=config.hidden_size,
-            nhead=8, # A reasonable default
-            dim_feedforward=config.hidden_size * 4, # Standard practice
-            dropout=0.1,
-            activation=F.gelu,
-            batch_first=True,
-            norm_first=True
-        )
+        # The attention-based readout is removed to prevent the model from "cheating"
+        # by using self-attention on the whole sequence instead of relying on its
+        # recurrent state. This forces the LNN to learn more robust representations.
+        # self.readout = nn.TransformerEncoderLayer(...)
         
         self.proj_out = nn.Linear(config.hidden_size, config.vocab_size)
 
@@ -245,17 +245,20 @@ class LNNModel(PreTrainedModel):
             layer_output, h_final = block(layer_output, h_initial)
             new_hidden_states.append(h_final)
 
-        # 4. Final Readout and Projection
-        readout_output = self.readout(layer_output)
-        readout_output = self.ln_final(readout_output)
-        logits = self.proj_out(readout_output)
+        # 4. Final Projection (without attention readout)
+        final_output = self.ln_final(layer_output)
+        logits = self.proj_out(final_output)
 
         # 5. Calculate loss if labels are provided
         loss = None
         if labels is not None:
+            # Shift so that logits at time t predict token at time t+1
+            # This is the standard procedure for training causal language models.
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
             # Flatten the tokens and compute loss
             loss_fct = torch.nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
         return LNNModelOutput(
             loss=loss,

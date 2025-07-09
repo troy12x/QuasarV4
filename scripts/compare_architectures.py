@@ -12,139 +12,155 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
+import time
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import sys
-import os
-import math
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+import pandas as pd
+from dataclasses import dataclass
 
-# Add project root to path to allow importing quasar
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# --- Setup Paths ---
+# Add project root to sys.path to allow for local package imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.abspath("./LFM"))
+
+# --- Model Imports ---
+# Quasar LNN Model
 from quasar.lnn import LNNModel, LNNConfig
+# Liquid Transformer Model
+from lfm_torch.liquid_t_moe import LiquidTransformer
 
 # --- Experiment Configuration ---
-FILE_PATH = 'c:\\quasarv4\\input.txt'
-DATA_SUBSET_SIZE = 90000  # Use a consistent subset for a fair, quick comparison
-SEQ_LENGTH = 128
-BATCH_SIZE = 64
+# Use a simple text for the dummy dataset
+DUMMY_TEXT = "abcdefghijklmnopqrstuvwxyz " * 100
+SEQ_LENGTH = 32
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-3
-NUM_EPOCHS = 2 # Train for a few epochs to see learning trends
-VALIDATION_SPLIT = 0.1
-SKIP_LNN_TRAINING = False # Set to True to skip LNN training for faster debugging
+NUM_EPOCHS = 2 # Train for a few epochs to see the learning trend
+VALIDATION_SPLIT = 0.2
+SKIP_LNN_TRAINING = True # Set to True to skip LNN training for faster debugging
 
-# --- Model Definitions ---
-# We will aim for a similar parameter count for a fair comparison.
-# We will aim for a much smaller parameter count (~1-2M) that is suitable for a consumer GPU.
+# --- Model Configurations (simplified and matched for comparison) ---
+# We will create small models to run quickly on the dummy data.
+# The key is to have a similar number of parameters.
+
+# Shared config
+VOCAB_SIZE = len(set(DUMMY_TEXT))
+HIDDEN_SIZE = 128
+NUM_LAYERS = 4
+
 LNN_MODEL_CONFIG = LNNConfig(
-    vocab_size=50257, # This will be updated by the tokenizer vocab size later
-    hidden_size=256,
-    num_hidden_layers=2,
-    chunk_size=64,
-    use_moe=True,
-    use_pmb=True
+    vocab_size=VOCAB_SIZE,
+    hidden_size=HIDDEN_SIZE,
+    num_hidden_layers=NUM_LAYERS,
 )
 
-TRANSFORMER_MODEL_CONFIG = {
-    "name": "Transformer Model",
-    "embed_size": 256,        # Reduced
-    "num_layers": 2,          # Reduced
-    "num_heads": 4,           # Reduced
-    "forward_expansion": 2    # Reduced
-}
+@dataclass
+class LFMConfig:
+    vocab_size: int = VOCAB_SIZE
+    embed_size: int = HIDDEN_SIZE
+    num_heads: int = 4
+    num_experts: int = 2
+    expert_size: int = HIDDEN_SIZE
+    num_layers: int = NUM_LAYERS
 
-# --- A Standard Transformer Model for Comparison ---
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
+# --- LFM Wrapper for Causal LM ---
+class LFMForCausalLM(nn.Module):
+    """Wraps the LiquidTransformer to add embedding and a language model head."""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embedding = nn.Embedding(config.vocab_size, config.embed_size)
+        self.transformer = LiquidTransformer(
+            embed_size=config.embed_size,
+            num_heads=config.num_heads,
+            num_experts=config.num_experts,
+            expert_size=config.expert_size,
+            num_layers=config.num_layers
+        )
+        self.lm_head = nn.Linear(config.embed_size, config.vocab_size)
+        self.transformer.hidden_state = None
 
-    def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        return self.dropout(x)
+    def forward(self, input_ids, labels=None, **kwargs):
+        batch_size = input_ids.shape[0]
+        if self.transformer.hidden_state is None or self.transformer.hidden_state.size(0) != batch_size:
+            self.transformer.hidden_state = torch.zeros(batch_size, self.config.embed_size, device=input_ids.device)
 
-class TransformerModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_layers, num_heads, forward_expansion, dropout=0.1):
-        super(TransformerModel, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.pos_encoder = PositionalEncoding(embed_size, dropout)
-        encoder_layers = nn.TransformerEncoderLayer(embed_size, num_heads, embed_size * forward_expansion, dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
-        self.fc_out = nn.Linear(embed_size, vocab_size)
-        self.config = lambda: None # for compatibility with evaluate function
-        self.config.vocab_size = vocab_size
+        embedded_input = self.embedding(input_ids)
+        transformer_output = self.transformer(embedded_input.unsqueeze(0))
+        logits = self.lm_head(transformer_output)
 
-    def forward(self, src, src_mask=None):
-        src = self.embedding(src)
-        src = self.pos_encoder(src)
-        output = self.transformer_encoder(src, src_mask)
-        output = self.fc_out(output)
-        return output, None # Return None for hidden state to match LNN's output signature
+        # Create a simple output object for compatibility
+        @dataclass
+        class LFMOutput:
+            loss: torch.Tensor
+            logits: torch.Tensor
 
-# --- Generic Training & Evaluation Code ---
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+        
+        return LFMOutput(loss=loss, logits=logits)
+
+# --- Dummy Dataset ---
 class TextDataset(Dataset):
-    def __init__(self, data, seq_length):
+    """A simple dataset to serve chunks of text."""
+    def __init__(self, data, seq_length, char_to_int):
         self.data = data
         self.seq_length = seq_length
+        self.char_to_int = char_to_int
 
     def __len__(self):
-        return len(self.data) - self.seq_length
+        return len(self.data) - self.seq_length - 1
 
     def __getitem__(self, idx):
-        chunk = self.data[idx:idx + self.seq_length + 1]
-        return torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long)
+        inputs = torch.tensor([self.char_to_int[c] for c in self.data[idx : idx + self.seq_length]], dtype=torch.long)
+        # Target is the next character in the sequence
+        targets = torch.tensor([self.char_to_int[c] for c in self.data[idx + 1 : idx + self.seq_length + 1]], dtype=torch.long)
+        return inputs, targets
 
-def evaluate(model, dataloader, criterion, device):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            # Use autocast for evaluation as well for consistency
-            with torch.cuda.amp.autocast():
-                logits, _ = model(inputs)
-                loss = criterion(logits.view(-1, model.config.vocab_size), targets.view(-1))
-            total_loss += loss.item()
-    return total_loss / len(dataloader)
-
+# --- Helper Functions ---
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def train_and_evaluate(model, train_loader, val_loader, device, model_name):
+def evaluate(model, val_loader, criterion, device):
+    """A simple evaluation loop."""
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(input_ids=inputs, labels=targets)
+            loss = outputs.loss
+            total_loss += loss.item()
+    return total_loss / len(val_loader)
+
+def train_and_evaluate(model, model_name, train_loader, val_loader, device):
+    """A simplified training and evaluation function."""
     print(f"\n--- Training {model_name} ---")
-    print(f"Model params: {count_parameters(model)/1e6:.2f}M")
+    print(f"Model params: {count_parameters(model)/1e6:.3f}M")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.CrossEntropyLoss()
-    # GradScaler for mixed-precision training
-    scaler = torch.cuda.amp.GradScaler()
+    criterion = nn.CrossEntropyLoss() # Although loss is calculated in model, useful for reference
     best_val_loss = float('inf')
+    start_time = time.time()
 
     for epoch in range(NUM_EPOCHS):
         model.train()
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", leave=False)
         for inputs, targets in progress_bar:
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-
-            # Forward pass with autocasting
-            with torch.cuda.amp.autocast():
-                logits, _ = model(inputs)
-                loss = criterion(logits.view(-1, model.config.vocab_size), targets.view(-1))
-
-            # Backward pass with scaling
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
+            outputs = model(input_ids=inputs, labels=targets)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
             progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         val_loss = evaluate(model, val_loader, criterion, device)
@@ -152,62 +168,52 @@ def train_and_evaluate(model, train_loader, val_loader, device, model_name):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
 
-    return best_val_loss
+    total_time = time.time() - start_time
+    print(f"--- Finished training {model_name} in {total_time:.2f}s ---")
+    return best_val_loss, total_time
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"--- Architecture Comparison: LNN vs. Transformer ---")
+    print(f"--- Architecture Comparison on Dummy Data---")
     print(f"Using device: {device}\n")
 
-    with open(FILE_PATH, 'r', encoding='utf-8') as f:
-        text = f.read()[:DATA_SUBSET_SIZE]
-    print(f"Using a subset of the data: first {len(text)} characters.")
-
-    chars = sorted(list(set(text)))
-    vocab_size = len(chars)
+    # --- Data Prep ---
+    chars = sorted(list(set(DUMMY_TEXT)))
     char_to_int = {ch: i for i, ch in enumerate(chars)}
-    data = [char_to_int[ch] for ch in text]
+    
+    split_idx = int(len(DUMMY_TEXT) * (1 - VALIDATION_SPLIT))
+    train_data, val_data = DUMMY_TEXT[:split_idx], DUMMY_TEXT[split_idx:]
 
-    split_idx = int(len(data) * (1 - VALIDATION_SPLIT))
-    train_data, val_data = data[:split_idx], data[split_idx:]
+    train_dataset = TextDataset(train_data, SEQ_LENGTH, char_to_int)
+    val_dataset = TextDataset(val_data, SEQ_LENGTH, char_to_int)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-    train_dataset = TextDataset(train_data, SEQ_LENGTH)
-    val_dataset = TextDataset(val_data, SEQ_LENGTH)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
+    print(f"Vocab size: {VOCAB_SIZE}, Train sequences: {len(train_dataset)}, Val sequences: {len(val_dataset)}")
 
-    print(f"Vocab size: {vocab_size}, Train sequences: {len(train_dataset)}, Val sequences: {len(val_dataset)}")
+    # --- Initialize Models ---
+    print("\nInitializing models...")
+    lnn_model = LNNModel(LNN_MODEL_CONFIG).to(device)
+    lfm_model = LFMForCausalLM(LFMConfig()).to(device)
 
-    # --- Initialize and Run Models ---
-    print("Initializing models...")
-
-    # LNN Model Run
-    lnn_loss = float('inf')
+    # --- Run Experiments ---
+    results = {}
     if not SKIP_LNN_TRAINING:
-        LNN_MODEL_CONFIG.vocab_size = vocab_size
-        lnn_model = LNNModel(LNN_MODEL_CONFIG).to(device)
-        lnn_loss = train_and_evaluate(lnn_model, train_loader, val_loader, device, "LNN Model")
+        lnn_loss, lnn_time = train_and_evaluate(lnn_model, "Quasar LNN", train_loader, val_loader, device)
+        results["Quasar LNN"] = {"Validation Loss": lnn_loss, "Training Time (s)": lnn_time, "Params (M)": count_parameters(lnn_model)/1e6}
     else:
         print("\n--- Skipping LNN training as requested ---")
+    
+    lfm_loss, lfm_time = train_and_evaluate(lfm_model, "Liquid Transformer", train_loader, val_loader, device)
+    results["Liquid Transformer"] = {"Validation Loss": lfm_loss, "Training Time (s)": lfm_time, "Params (M)": count_parameters(lfm_model)/1e6}
 
-    # Transformer Model Run
-    transformer_params = {k: v for k, v in TRANSFORMER_MODEL_CONFIG.items() if k != 'name'}
-    transformer_model = TransformerModel(vocab_size=vocab_size, **transformer_params).to(device)
-    transformer_loss = train_and_evaluate(transformer_model, train_loader, val_loader, device, TRANSFORMER_MODEL_CONFIG['name'])
-
-    print("\n--- Experiment Complete: Final Report ---")
-    if not SKIP_LNN_TRAINING:
-        print(f"LNN Model Final Validation Loss: {lnn_loss:.4f}")
-    print(f"Transformer Model Final Validation Loss: {transformer_loss:.4f}")
-
-    print("\n--- Conclusion ---")
-    if not SKIP_LNN_TRAINING:
-        if lnn_loss < transformer_loss:
-            print("The LNN model achieved a lower validation loss, supporting the hypothesis that it is more parameter-efficient.")
-        elif transformer_loss < lnn_loss:
-            print("The Transformer model achieved a lower validation loss in this experiment.")
-        else:
-            print("The models performed almost identically.")
+    # --- Final Report ---
+    print("\n\n--- Comparison Complete: Final Report ---")
+    report_df = pd.DataFrame.from_dict(results, orient="index")
+    print(report_df.to_string(formatters={'Params (M)': '{:,.3f}'.format, 'Validation Loss': '{:,.4f}'.format, 'Training Time (s)': '{:,.2f}'.format}))
+    
+    winner = report_df["Validation Loss"].idxmin()
+    print(f"\n--- Winner: {winner} (based on lowest validation loss) ---")
 
 if __name__ == "__main__":
     main()
