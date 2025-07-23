@@ -21,7 +21,6 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_scheduler, DataCollatorForLanguageModeling
-from cycling_utils import InterruptableDistributedSampler, atomic_torch_save
 from contextlib import contextmanager
 
 @contextmanager
@@ -81,8 +80,8 @@ logger = logging.getLogger(__name__)
 
 
 # --- Checkpoint Saving ---
-def save_checkpoint(model, optimizer, scheduler, tokenizer, train_sampler, args, global_step, epoch, tokens_processed):
-    """Saves a full training state checkpoint for resumability using atomic saving."""
+def save_checkpoint(model, optimizer, scheduler, tokenizer, args, global_step, epoch, tokens_processed):
+    """Saves a full training state checkpoint for resumability."""
     if not is_main_process(args.single_gpu):
         return
 
@@ -100,12 +99,11 @@ def save_checkpoint(model, optimizer, scheduler, tokenizer, train_sampler, args,
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'sampler_state_dict': train_sampler.state_dict(),
         'args': args,
         'epoch': epoch,
         'tokens_processed': tokens_processed,
     }
-    atomic_torch_save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
+    torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
 
     # Also save the model and tokenizer in the standard Hugging Face format
     # for easy interoperability.
@@ -392,7 +390,7 @@ def main():
          eval_dataset = Dataset.load_from_disk(cached_eval_dataset_path)
          eval_dataset.set_format("torch")
     
-    train_sampler = InterruptableDistributedSampler(train_dataset) if not args.single_gpu else RandomSampler(train_dataset)
+    train_sampler = RandomSampler(train_dataset) if args.single_gpu else DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
     train_dataloader = DataLoader(
         train_dataset, batch_size=args.per_device_train_batch_size, sampler=train_sampler, collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False), pin_memory=True, drop_last=True
     )
@@ -490,10 +488,8 @@ def main():
             
             start_epoch = checkpoint.get('epoch', 0)
             global_step = checkpoint.get('global_step', 0)
-            tokens_processed = checkpoint.get('tokens_processed', 0) # For backward compatibility
-        if 'sampler_state_dict' in checkpoint and not args.single_gpu:
-            train_sampler.load_state_dict(checkpoint['sampler_state_dict'])
-            logger.info(f"Resumed sampler state at step {train_sampler.state_dict()['progress']}")
+            tokens_processed = checkpoint.get('tokens_processed', 0)
+            logger.info(f"Successfully resumed from epoch {start_epoch}, global step {global_step}. LR is {lr_scheduler.get_last_lr()[0]:.2e}")
         else:
             logger.warning(f"'training_state.pt' not found. Attempting to load model weights from 'pytorch_model.bin'.")
             weights_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
@@ -580,11 +576,9 @@ def main():
                     }
                     wandb.log(log_stats, step=completed_steps)
 
-                if not args.single_gpu:
-                    train_sampler.advance(args.per_device_train_batch_size)
 
                 if completed_steps > 0 and completed_steps % args.checkpointing_steps == 0 and is_main_process(args.single_gpu):
-                    save_checkpoint(model, optimizer, lr_scheduler, tokenizer, train_sampler, args, completed_steps, epoch, tokens_processed)
+                    save_checkpoint(model, optimizer, lr_scheduler, tokenizer,args, completed_steps, epoch, tokens_processed)
 
                 # --- Evaluation ---
                 # All processes must participate in evaluation to avoid deadlocks.
