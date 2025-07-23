@@ -57,40 +57,6 @@ for t in range(seq_len):
 After the loop, a residual connection and a `LayerNorm` are applied for stabilization.
 
 ---
-
-## 3. Performance Optimization: Targeted JIT Compilation
-
-A major challenge was the performance of the recurrent loop inside the `LNNBlock`. A native Python `for` loop is notoriously slow. The solution was to apply **targeted Just-In-Time (JIT) compilation** using `torch.jit.script`.
-
-During the `LNNModel`'s initialization, each `LNNBlock` is individually compiled:
-
-```python
-# In LNNModel.__init__
-for i in range(len(self.blocks)):
-    self.blocks[i] = torch.jit.script(self.blocks[i])
-```
-
-This approach was highly effective:
--   **Performance**: The JIT compiler converts the Python loop in each block into a highly optimized, graph-based representation, eliminating Python interpreter overhead and resulting in a **>70% speedup** in inference time.
--   **Compatibility**: By compiling only the self-contained `LNNBlock`s, we avoided the compilation errors that occurred when attempting to compile the entire model, which included the incompatible `TransformerEncoderLayer` from the `transformers` library.
-
-This selective optimization strategy provided the best of both worlds: the raw performance of compiled code for the bottleneck components and the flexibility of Python for the overall model structure.
-
-new results 
-Sequence Length | LCM Time (ms) | Transformer Time (ms)
-----------------|---------------|-----------------------
-32              | 12.9693       | 0.9985
-64              | 24.7283       | 0.5050
-128             | 49.3932       | 1.0126
-256             | 98.4762       | 1.0002
-512             | 186.3220      | 1.0002
-1024            | 369.4563      | 2.0010
-2048            | 725.6646      | 1.7722
-
-----
-old reuslts :
-Sequence Length | LCM Time (ms) | Transformer Time (ms)
-----------------|---------------|-----------------------
 32              | 28.8899       | 1.5111
 64              | 67.3220       | 1.0002
 128             | 121.6915      | 0.7701
