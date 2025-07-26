@@ -153,7 +153,7 @@ def parse_args():
     parser.add_argument("--dataset_config_name", type=str, default=None, help="The configuration name of the dataset to use.")
     parser.add_argument("--train_split_name", type=str, default="train", help="The name of the training data split to use.")
     parser.add_argument("--validation_split_name", type=str, default="validation", help="The name of the validation data split to use.")
-    parser.add_argument("--validation_split_percentage", type=float, default=0.1, help="Percentage of training data to use for validation if validation split doesn't exist (e.g., 0.1 for 0.1%%).")
+    parser.add_argument("--validation_split_percentage", type=float, default=0.001, help="Percentage of training data to use for validation if validation split doesn't exist (e.g., 0.1 for 0.1%%).")
     parser.add_argument("--text_column", type=str, default="text", help="The name of the column in the dataset containing the text.")
     parser.add_argument("--sequence_length", type=int, default=2048, help="The sequence length for packing the dataset.")
 
@@ -397,7 +397,7 @@ def main():
 
     eval_dataloader = None
     if eval_dataset:
-        eval_sampler = RandomSampler(eval_dataset) if args.single_gpu else InterruptableDistributedSampler(eval_dataset, shuffle=False)
+        eval_sampler = SequentialSampler(eval_dataset) if args.single_gpu else DistributedSampler(eval_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
         eval_dataloader = DataLoader(
             eval_dataset, batch_size=args.per_device_eval_batch_size, sampler=eval_sampler, collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False), pin_memory=True, drop_last=True
         )
