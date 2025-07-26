@@ -18,13 +18,13 @@ import math
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
+from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils.generic import ModelOutput
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 from .pmb import ParameterMemoryBank
 from .moe import MoELayer, Expert
-
 
 from tqdm import tqdm
 
@@ -70,6 +70,7 @@ class LNNConfig(PretrainedConfig):
         self.dt = dt
         self.activation = activation
         self.initializer_range = initializer_range
+        self.dropout = dropout
         self.use_pmb = use_pmb
         self.pmb_num_blocks = pmb_num_blocks
         self.pmb_slots_per_block = pmb_slots_per_block
@@ -177,7 +178,7 @@ class LNNBlock(nn.Module):
         return output, h
 
 # --- 5. Full LNN Model ---
-class LNNModel(PreTrainedModel):
+class LNNModel(PreTrainedModel, GenerationMixin):
     """
     The Liquid Neural Network Model.
     This version restores the architecture from the high-performing `old_lnn.py`.
@@ -263,5 +264,248 @@ class LNNModel(PreTrainedModel):
         return LNNModelOutput(
             loss=loss,
             logits=logits,
+            last_hidden_state=final_output,
             hidden_states=tuple(new_hidden_states),
         )
+
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_length: int = 100,
+        max_new_tokens: int = None,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        do_sample: bool = True,
+        pad_token_id: int = None,
+        eos_token_id: int = None,
+        repetition_penalty: float = 1.0,
+        **kwargs
+    ) -> torch.LongTensor:
+        """
+        Generate text using the LNN model with improved repetition handling.
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Determine actual max length
+        if max_new_tokens is not None:
+            max_length = input_ids.shape[1] + max_new_tokens
+        
+        # Initialize hidden states
+        hidden_states = [
+            torch.zeros(batch_size, self.config.hidden_size, device=device)
+            for _ in range(self.config.num_hidden_layers)
+        ]
+        
+        # Initialize output with input_ids
+        generated = input_ids.clone()
+        
+        # Set model to evaluation mode
+        self.eval()
+        
+        for step in range(max_length - input_ids.shape[1]):
+            # Get model output - only pass the last few tokens to avoid recomputing everything
+            context_length = min(generated.shape[1], 512)  # Limit context to prevent memory issues
+            context_ids = generated[:, -context_length:]
+            
+            with torch.no_grad():
+                outputs = self.forward(
+                    input_ids=context_ids,
+                    hidden_states=hidden_states if step == 0 else None  # Only use initial hidden states
+                )
+                
+                # Get logits for the last token
+                logits = outputs.logits[:, -1, :]  # Shape: [batch_size, vocab_size]
+                
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for i in range(batch_size):
+                        for token_id in set(generated[i].tolist()):
+                            # If logit is positive, divide by penalty, else multiply
+                            if logits[i, token_id] > 0:
+                                logits[i, token_id] /= repetition_penalty
+                            else:
+                                logits[i, token_id] *= repetition_penalty
+                
+                # Apply temperature
+                if temperature != 1.0:
+                    logits = logits / temperature
+                
+                # Apply top-k filtering
+                if top_k > 0:
+                    top_k_values, _ = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
+                    indices_to_remove = logits < top_k_values[..., -1, None]
+                    logits[indices_to_remove] = -float('inf')
+                
+                # Apply top-p filtering
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    # Remove tokens with cumulative probability above the threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    # Convert back to original indices
+                    indices_to_remove = sorted_indices_to_remove.gather(dim=-1, index=sorted_indices.argsort(dim=-1))
+                    logits[indices_to_remove] = -float('inf')
+                
+                # Sample next token
+                if do_sample:
+                    probs = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                
+                # Append to generated sequence
+                generated = torch.cat([generated, next_token], dim=-1)
+                
+                # Check for EOS token
+                if eos_token_id is not None and (next_token == eos_token_id).all():
+                    break
+        
+        return generated
+
+    def generate_simple(
+        self,
+        input_ids: torch.LongTensor,
+        max_length: int = 100,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        pad_token_id: int = None,
+        eos_token_id: int = None,
+        hidden_states: Optional[List[torch.Tensor]] = None,
+        **kwargs
+    ) -> torch.LongTensor:
+        """
+        Simple generate method without top-k/top-p sampling to avoid dimension issues.
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Initialize hidden states if not provided
+        if hidden_states is None:
+            hidden_states = [
+                torch.zeros(batch_size, self.config.hidden_size, device=device)
+                for _ in range(self.config.num_hidden_layers)
+            ]
+        
+        # Initialize output with input_ids
+        generated = input_ids.clone()
+        
+        # Set model to evaluation mode
+        self.eval()
+        
+        for _ in range(max_length - input_ids.shape[1]):
+            # Get model output
+            with torch.no_grad():
+                outputs = self.forward(
+                    input_ids=generated,
+                    hidden_states=hidden_states
+                )
+                
+                # Get logits for the last token
+                logits = outputs.logits[:, -1, :]  # Shape: [batch_size, vocab_size]
+                hidden_states = list(outputs.hidden_states)
+                
+                # Apply temperature
+                if temperature != 1.0:
+                    logits = logits / temperature
+                
+                # Sample next token
+                if do_sample:
+                    probs = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                
+                # Append to generated sequence
+                generated = torch.cat([generated, next_token], dim=-1)
+                
+                # Check for EOS token
+                if eos_token_id is not None and (next_token == eos_token_id).all():
+                    break
+        
+        return generated
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
+        **kwargs
+    ) -> dict:
+        """
+        Prepare inputs for generation. For LNN, we use hidden_states instead of past_key_values.
+        """
+        # For LNN, we don't use past_key_values in the traditional sense
+        # Instead, we rely on the recurrent nature of the model
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "use_cache": use_cache,
+        }
+        return model_inputs
+
+    def _reorder_cache(self, past_key_values: List[torch.Tensor], beam_idx: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Reorder hidden states for beam search.
+        """
+        if past_key_values is None:
+            return None
+        
+        reordered_past = []
+        for hidden_state in past_key_values:
+            reordered_past.append(hidden_state.index_select(0, beam_idx))
+        return reordered_past
+
+# --- 6. For Causal LM compatibility ---
+class LNNForCausalLM(LNNModel):
+    """
+    Wrapper class for compatibility with HuggingFace's CausalLM interface.
+    """
+    def __init__(self, config: LNNConfig):
+        super().__init__(config)
+        self.lm_head = self.proj_out  # Alias for compatibility
+        
+    @property
+    def model(self):
+        """Return self for compatibility with some HF utilities."""
+        return self
+
+    def get_output_embeddings(self):
+        return self.proj_out
+
+    def set_output_embeddings(self, new_embeddings):
+        self.proj_out = new_embeddings
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        labels: Optional[torch.LongTensor] = None,
+        hidden_states: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.Tensor]] = None,
+        use_cache: bool = True,
+        **kwargs,
+    ) -> LNNModelOutput:
+        """Forward pass that's compatible with CausalLM interface."""
+        return super().forward(
+            input_ids=input_ids,
+            labels=labels,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            **kwargs
+        )
+
+# --- 7. Model registration ---
+# Register the model with transformers
+try:
+    from transformers import AutoModel, AutoModelForCausalLM
+    AutoModel.register(LNNConfig, LNNModel)
+    AutoModelForCausalLM.register(LNNConfig, LNNForCausalLM)
+except ImportError:
+    pass  # transformers not available or version doesn't support registration
