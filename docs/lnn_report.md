@@ -76,4 +76,25 @@ This approach was highly effective:
 
 This selective optimization strategy provided the best of both worlds: the raw performance of compiled code for the bottleneck components and the flexibility of Python for the overall model structure.
 
-ne
+new results 
+Sequence Length | LCM Time (ms) | Transformer Time (ms)
+----------------|---------------|-----------------------
+32              | 12.9693       | 0.9985
+64              | 24.7283       | 0.5050
+128             | 49.3932       | 1.0126
+256             | 98.4762       | 1.0002
+512             | 186.3220      | 1.0002
+1024            | 369.4563      | 2.0010
+2048            | 725.6646      | 1.7722
+
+----
+old reuslts :
+Sequence Length | LCM Time (ms) | Transformer Time (ms)
+----------------|---------------|-----------------------
+32              | 28.8899       | 1.5111
+64              | 67.3220       | 1.0002
+128             | 121.6915      | 0.7701
+256             | 239.7285      | 1.0054
+512             | 480.0656      | 1.0056
+1024            | 989.9151      | 3.0315
+2048            | 1833.9663     | 9.5251
