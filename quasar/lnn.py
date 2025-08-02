@@ -22,6 +22,7 @@ from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils.generic import ModelOutput
 from typing import Optional, Tuple, List
+from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 from .pmb import ParameterMemoryBank
 from .moe import MoELayer, Expert
@@ -234,16 +235,31 @@ class LNNModel(PreTrainedModel, GenerationMixin):
         # 2. Initialize hidden states if not provided
         if hidden_states is None:
             hidden_states = [
-                torch.zeros(batch_size, self.config.hidden_size, device=x.device)
+                torch.zeros(batch_size, self.config.hidden_size, device=x.device, dtype=x.dtype)
                 for _ in range(self.config.num_hidden_layers)
             ]
 
         # 3. Process sequence through LNN blocks
         new_hidden_states = []
         layer_output = x
+
+        # Check if gradient checkpointing is enabled and if we are in training mode
+        use_checkpointing = self.training and getattr(self.config, 'gradient_checkpointing', False)
+
         for i, block in enumerate(self.blocks):
             h_initial = hidden_states[i]
-            layer_output, h_final = block(layer_output, h_initial)
+
+            if use_checkpointing:
+                # Pass a function that calls the block's forward method
+                layer_output, h_final = checkpoint(
+                    block, 
+                    layer_output, 
+                    h_initial, 
+                    use_reentrant=False
+                )
+            else:
+                layer_output, h_final = block(layer_output, h_initial)
+            
             new_hidden_states.append(h_final)
 
         # 4. Final Projection (without attention readout)
