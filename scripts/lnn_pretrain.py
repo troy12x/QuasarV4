@@ -4,7 +4,8 @@ import argparse
 import shutil
 import math
 import time
-from huggingface_hub import login
+import warnings
+from huggingface_hub import login, snapshot_download
 from huggingface_hub.utils import HfHubHTTPError
 import logging
 import torch
@@ -13,6 +14,9 @@ import torch
 
 # Add project root to sys.path to allow for local package imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Suppress the torch pytree deprecation warning from transformers
+warnings.filterwarnings("ignore", message="`torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.", category=FutureWarning)
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -40,6 +44,8 @@ def main_process_first(local_rank: int):
 from datasets import load_dataset, Dataset, get_dataset_split_names
 from itertools import chain
 
+import deepspeed
+
 # Local imports
 from quasar.lnn import LNNModel, LNNConfig
 from huggingface_hub import create_repo
@@ -47,19 +53,38 @@ from huggingface_hub import create_repo
 # Note: We will use a standard AdamW optimizer and the default data collator,
 # so a custom utils file is no longer needed.
 from torch.optim import AdamW
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 
 
 # --- Distributed Training Setup ---
 def setup_distributed(timeout_seconds):
-    """Initializes the distributed process group with a configurable timeout."""
+    """Initializes the distributed process group and sets the device for the current process."""
     import datetime
-    dist.init_process_group(
-        backend="nccl", 
-        timeout=datetime.timedelta(seconds=timeout_seconds)
-    )
+
+    # Get local rank from environment variable set by torchrun.
     local_rank = int(os.environ["LOCAL_RANK"])
+
+    # Set the device for the current process. This MUST be done before initializing the process group.
     torch.cuda.set_device(local_rank)
-    return local_rank
+    device = torch.device("cuda", local_rank)
+
+    # It's recommended to have MASTER_ADDR and MASTER_PORT set in the environment
+    if not all(k in os.environ for k in ("MASTER_ADDR", "MASTER_PORT")):
+        logger.warning("MASTER_ADDR or MASTER_PORT not set, using default localhost:12355")
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "12355")
+
+    # Initialize the process group with explicit device ID to avoid warnings.
+    dist.init_process_group(
+        backend="nccl",
+        timeout=datetime.timedelta(seconds=timeout_seconds),
+        device_id=device
+    )
+
+    # Barrier with explicit device ID to avoid warnings.
+    dist.barrier(device_ids=[local_rank])
+    logger.info(f"Rank {dist.get_rank()} initialized on device {device} successfully.")
+    return local_rank, device
 
 def cleanup_distributed():
     """Cleans up the distributed process group."""
@@ -90,25 +115,25 @@ def save_checkpoint(model, optimizer, scheduler, tokenizer, args, global_step, e
 
     logger.info(f"Saving full training checkpoint to {checkpoint_dir}")
 
-    # Unwrap the model if using DDP
-    model_to_save = model.module if hasattr(model, 'module') else model
+    if args.deepspeed:
+        # DeepSpeed handles checkpoint saving across all processes
+        model.save_checkpoint(checkpoint_dir, client_state={'epoch': epoch, 'global_step': global_step, 'tokens_processed': tokens_processed})
+    elif is_main_process(args.single_gpu):
+        # Standard DDP checkpoint saving on main process
+        model_to_save = model.module if hasattr(model, 'module') else model
+        model_to_save.save_pretrained(checkpoint_dir)
+        tokenizer.save_pretrained(checkpoint_dir)
+        torch.save(args, os.path.join(checkpoint_dir, "training_args.bin"))
 
-    # Save training state in a single file for atomicity
-    training_state = {
-        'global_step': global_step,
-        'model_state_dict': model_to_save.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'args': args,
-        'epoch': epoch,
-        'tokens_processed': tokens_processed,
-    }
-    torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
-
-    # Also save the model and tokenizer in the standard Hugging Face format
-    # for easy interoperability.
-    model_to_save.save_pretrained(checkpoint_dir, safe_serialization=False)
-    tokenizer.save_pretrained(checkpoint_dir)
+        training_state = {
+            'epoch': epoch,
+            'global_step': global_step,
+            'tokens_processed': tokens_processed,
+            'model_state_dict': model_to_save.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': lr_scheduler.state_dict(),
+        }
+        torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
 
     logger.info(f"Full checkpoint saved successfully to {checkpoint_dir}")
 
@@ -153,7 +178,7 @@ def parse_args():
     parser.add_argument("--dataset_config_name", type=str, default=None, help="The configuration name of the dataset to use.")
     parser.add_argument("--train_split_name", type=str, default="train", help="The name of the training data split to use.")
     parser.add_argument("--validation_split_name", type=str, default="validation", help="The name of the validation data split to use.")
-    parser.add_argument("--validation_split_percentage", type=float, default=0.1, help="Percentage of training data to use for validation if validation split doesn't exist (e.g., 0.1 for 0.1%%).")
+    parser.add_argument("--validation_split_percentage", type=float, default=0.001, help="Percentage of training data to use for validation if validation split doesn't exist (e.g., 0.1 for 0.1%%).")
     parser.add_argument("--text_column", type=str, default="text", help="The name of the column in the dataset containing the text.")
     parser.add_argument("--sequence_length", type=int, default=2048, help="The sequence length for packing the dataset.")
 
@@ -177,6 +202,7 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping max norm.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--bf16", action="store_true", help="Use BF16 mixed precision (recommended for H100).")
+    parser.add_argument("--fp16", action="store_true", help="Use FP16 mixed precision (recommended for older GPUs).")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Use gradient checkpointing to save memory.")
     
     # Checkpointing & Logging
@@ -184,10 +210,14 @@ def parse_args():
     parser.add_argument("--checkpointing_steps", type=int, default=1000, help="Save checkpoint every N steps.")
     parser.add_argument("--max_checkpoints_to_keep", type=int, default=3, help="The maximum number of recent checkpoints to keep.")
     parser.add_argument("--eval_steps", type=int, default=1000, help="Run evaluation every N steps.")
-    parser.add_argument("--logging_steps", type=int, default=5, help="Log every N steps.")
+    parser.add_argument("--logging_steps", type=int, default=1, help="Log every N steps.")
     parser.add_argument("--wandb_project", type=str, default="lnn-pretraining", help="Weights & Biases project name.")
     parser.add_argument("--single_gpu", action="store_true", help="Run on a single GPU without distributed training for testing.")
-    parser.add_argument("--ddp_timeout", type=int, default=300, help="Timeout in seconds for DDP initialization.")
+    parser.add_argument("--ddp_timeout", type=int, default=7200, help="Timeout for DDP initialization (in seconds). Increased default to 2 hours.")
+
+    # --- DeepSpeed Arguments ---
+    parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed.")
+    parser.add_argument("--deepspeed_config", type=str, default="ds_config.json", help="Path to DeepSpeed config file.")
     parser.add_argument("--overwrite_cache", action="store_true", help="Overwrite the cached tokenized dataset if it exists.")
     parser.add_argument("--data_cache_dir", type=str, default="./cached_data", help="Directory to cache the processed dataset.")
     parser.add_argument("--num_proc", type=int, default=128, help="Number of processes for dataset processing. Reduce if you encounter out-of-memory errors.")
@@ -199,6 +229,11 @@ def parse_args():
     parser.add_argument("--debug_nan", action="store_true", help="Enable anomaly detection for debugging NaN loss.")
 
     args, _ = parser.parse_known_args()
+    
+    # Validate precision arguments
+    if args.bf16 and args.fp16:
+        raise ValueError("Cannot use both --bf16 and --fp16. Please choose one.")
+    
     return args
 
 # --- Evaluation Function ---
@@ -243,6 +278,10 @@ def evaluate(model, dataloader, device, autocast_dtype, args):
 def main():
     args = parse_args()
 
+    # Disable wandb in all processes except the main one to prevent NFS errors.
+    if not (os.environ.get("RANK", "0") == "0" and os.environ.get("LOCAL_RANK", "0") == "0"):
+        os.environ["WANDB_DISABLED"] = "true"
+
     # --- Setup ---
     if args.single_gpu:
         local_rank = 0
@@ -250,8 +289,8 @@ def main():
         world_size = 1
         setup_logging(single_gpu_mode=True)
     else:
-        local_rank = setup_distributed(args.ddp_timeout)
-        device = torch.device(f"cuda:{local_rank}")
+        # setup_distributed now handles all device setup and returns the configured rank and device.
+        local_rank, device = setup_distributed(args.ddp_timeout)
         world_size = dist.get_world_size()
         setup_logging()
 
@@ -403,45 +442,92 @@ def main():
         )
 
     logger.info("Initializing model...")
-    if args.model_name_or_path:
-        logger.info(f"Loading pretrained LNN model from: {args.model_name_or_path}")
-        model = LNNModel.from_pretrained(args.model_name_or_path)
+    
+    # --- Model Initialization & Weight Loading ---
+    # This logic handles creating a new model or loading weights from a checkpoint.
+    # It's crucial to load weights *before* initializing DeepSpeed.
+    model_config_args = {
+        'vocab_size': len(tokenizer),
+        'hidden_size': args.hidden_size,
+        'num_hidden_layers': args.num_hidden_layers,
+        'dt': args.dt,
+        'use_moe': args.use_moe,
+        'num_experts': args.num_experts,
+        'num_experts_per_tok': args.num_experts_per_tok,
+        'pad_token_id': tokenizer.pad_token_id,
+        'eos_token_id': tokenizer.eos_token_id,
+    }
+
+    # Determine the path to load from, prioritizing resume_from_checkpoint
+    load_path = args.resume_from_checkpoint or args.model_name_or_path
+
+    if load_path:
+        logger.info(f"Loading pretrained LNN model from: {load_path}")
+        # If the path is a Hub ID, download it first
+        if not os.path.isdir(load_path) and '/' in load_path:
+            logger.info(f"Downloading model '{load_path}' from Hugging Face Hub...")
+            load_path = snapshot_download(repo_id=load_path, token=os.environ.get("HF_TOKEN"))
+        
+        # Load the model in FP32 to ensure compatibility before DeepSpeed handles precision
+        model = LNNModel.from_pretrained(load_path, torch_dtype=torch.float32)
+        logger.info(f"Successfully loaded model weights from {load_path}")
     else:
         logger.info(f"Creating a new LNN model from scratch with hidden_size={args.hidden_size} and num_layers={args.num_hidden_layers}")
-        config = LNNConfig(
-            vocab_size=len(tokenizer),
-            hidden_size=args.hidden_size,
-            num_hidden_layers=args.num_hidden_layers,
-            dt=args.dt,
-            use_moe=args.use_moe,
-            num_experts=args.num_experts,
-            num_experts_per_tok=args.num_experts_per_tok,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        config = LNNConfig(**model_config_args)
         model = LNNModel(config)
+    
+    # Log the precision strategy
+    if args.bf16:
+        logger.info("Model parameters in FP32, using BF16 mixed precision for forward/backward passes")
+    elif args.fp16:
+        logger.info("Model parameters in FP32, using FP16 mixed precision for forward/backward passes")
+    else:
+        logger.info("Using FP32 precision training")
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        # The model internally handles gradient checkpointing based on this flag.
+        # The explicit model.gradient_checkpointing_enable() call is not needed and was causing a crash.
+        logger.info("Gradient checkpointing enabled.")
 
+    # Move model to the correct device
     model = model.to(device)
-    if not args.single_gpu:
+    # Set up optimizer parameters, separating weight decay groups
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    if args.deepspeed:
+        optimizer = DeepSpeedCPUAdam(optimizer_grouped_parameters, lr=args.learning_rate, betas=args.adam_betas)
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            args=args,
+            model=model,
+            optimizer=optimizer,
+            dist_init_required=False  # We've already initialized distributed
+        )
+    else:
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            lr=args.learning_rate,
+            betas=args.adam_betas,
+            weight_decay=args.weight_decay
+        )
         # Since MoE layers are not used by default and the architecture is static,
         # we can set find_unused_parameters=False for a performance gain.
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     # Enable anomaly detection if the debug flag is set
     if args.debug_nan:
         logger.warning("Enabling anomaly detection for debugging. This will slow down training.")
         torch.autograd.set_detect_anomaly(True)
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        betas=args.adam_betas,
-        weight_decay=args.weight_decay
-    )
-    
     # Calculate total training steps. If max_train_steps is provided, it overrides num_train_epochs.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -457,12 +543,13 @@ def main():
     else:
         logger.info(f"Using specified number of warmup steps: {args.num_warmup_steps}")
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps
-    )
+    if not args.deepspeed:
+        lr_scheduler = get_scheduler(
+            name=args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=args.max_train_steps
+        )
 
     # --- Resume from Checkpoint ---
     global_step = 0
@@ -471,17 +558,50 @@ def main():
 
     if args.resume_from_checkpoint:
         checkpoint_dir = args.resume_from_checkpoint
+        # If the checkpoint is a Hub ID and not a local directory, download it first.
+        if not os.path.isdir(checkpoint_dir) and '/' in checkpoint_dir:
+            logger.info(f"Downloading checkpoint '{checkpoint_dir}' from Hugging Face Hub...")
+            try:
+                # Download the repo to a local cache and update checkpoint_dir to the local path.
+                checkpoint_dir = snapshot_download(
+                    repo_id=checkpoint_dir,
+                    allow_patterns=["*.bin", "*.json", "*.pt", "tokenizer.model", "*.py"],
+                    token=os.environ.get("HF_TOKEN")
+                )
+                logger.info(f"Checkpoint downloaded to: {checkpoint_dir}")
+            except Exception as e:
+                logger.error(f"FATAL: Failed to download checkpoint from Hub: {e}")
+                sys.exit(1)
+        args.resume_from_checkpoint = checkpoint_dir # Update args to point to the local path
+        checkpoint_dir = args.resume_from_checkpoint
         logger.info(f"Attempting to resume from checkpoint: {checkpoint_dir}")
 
+    if args.deepspeed and args.resume_from_checkpoint:
+        # If we are resuming, we check if it's a full DeepSpeed checkpoint.
+        # The model weights have already been loaded, so here we only care about the training state.
+        if os.path.exists(os.path.join(args.resume_from_checkpoint, 'latest')):
+            logger.info(f"Found a valid DeepSpeed checkpoint. Resuming full training state from {args.resume_from_checkpoint}")
+            # This will load optimizer, scheduler, and other states.
+            load_path, client_state = model.load_checkpoint(args.resume_from_checkpoint)
+            if load_path is None:
+                logger.error(f"FATAL: Failed to load DeepSpeed checkpoint from {args.resume_from_checkpoint}")
+                sys.exit(1)
+            global_step = client_state.get('global_step', 0)
+            start_epoch = client_state.get('epoch', 0)
+            tokens_processed = client_state.get('tokens_processed', 0)
+            logger.info(f"Successfully resumed from DeepSpeed checkpoint. Resuming at epoch {start_epoch}, global step {global_step}.")
+        else:
+            logger.info(f"Checkpoint at '{args.resume_from_checkpoint}' is not a full DeepSpeed checkpoint. Proceeding with loaded weights and a fresh optimizer.")
+    # This block handles resuming from a standard PyTorch DDP checkpoint (non-DeepSpeed)
+    if args.resume_from_checkpoint and not args.deepspeed:
+        checkpoint_dir = args.resume_from_checkpoint
         training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
         if os.path.exists(training_state_path):
             logger.info(f"Found full training state at {training_state_path}. Loading...")
-            # weights_only=False is critical to load optimizer/scheduler
-            checkpoint = torch.load(training_state_path, map_location=device, weights_only=False)
+            checkpoint = torch.load(training_state_path, map_location=device)
             
             model_to_load = model.module if not args.single_gpu else model
-            # Use strict=False to allow loading from a checkpoint that has more keys (e.g., from the old readout layer)
-            model_to_load.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            model_to_load.load_state_dict(checkpoint['model_state_dict'])
             
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -491,25 +611,31 @@ def main():
             tokens_processed = checkpoint.get('tokens_processed', 0)
             logger.info(f"Successfully resumed from epoch {start_epoch}, global step {global_step}. LR is {lr_scheduler.get_last_lr()[0]:.2e}")
         else:
-            logger.warning(f"'training_state.pt' not found. Attempting to load model weights from 'pytorch_model.bin'.")
-            weights_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
-            if os.path.exists(weights_path):
-                model_to_load = model.module if not args.single_gpu else model
-                # weights_only=True is safer as we only expect model weights here.
-                state_dict = torch.load(weights_path, map_location=device, weights_only=True)
-                # Use strict=False to allow loading from a checkpoint that has more keys
-                model_to_load.load_state_dict(state_dict, strict=False)
-                logger.info(f"Successfully loaded model weights from {weights_path}. Optimizer and scheduler are not restored.")
-            else:
-                logger.error(f"FATAL: Could not find 'training_state.pt' or 'pytorch_model.bin' in {checkpoint_dir}. Cannot resume training.")
-                sys.exit(1) # Exit because we cannot fulfill the resume request.
+            # If only model weights are present, they would have been loaded already.
+            # This path is for when a full training state was expected but not found.
+            logger.error(f"FATAL: 'training_state.pt' not found in {checkpoint_dir}. Cannot resume full DDP training state.")
+            sys.exit(1)
 
     logger.info("***** Starting Training *****")
     logger.info(f"  Total train batch size = {args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    autocast_dtype = torch.bfloat16 if args.bf16 else torch.float32
-    scaler = torch.cuda.amp.GradScaler(enabled=args.bf16)
+    # Determine precision and autocast dtype
+    if args.bf16:
+        autocast_dtype = torch.bfloat16
+        use_amp = True
+        logger.info("Using BF16 mixed precision training")
+    elif args.fp16:
+        autocast_dtype = torch.float16
+        use_amp = True
+        logger.info("Using FP16 mixed precision training")
+    else:
+        autocast_dtype = torch.float32
+        use_amp = False
+        logger.info("Using FP32 precision training")
+    
+    if not args.deepspeed:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
     completed_steps = global_step
     model.train()
@@ -537,47 +663,64 @@ def main():
             batch_tokens = batch['input_ids'].numel() * world_size
             tokens_processed += batch_tokens
 
-            with torch.amp.autocast(device_type='cuda', dtype=autocast_dtype):
+            # DeepSpeed handles autocasting internally based on its config.
+            # We only need to manually manage autocast for standard DDP.
+            if not args.deepspeed:
+                with torch.amp.autocast(device_type='cuda', dtype=autocast_dtype):
+                    outputs = model(**batch, labels=labels)
+                    loss = outputs.loss
+            else:
+                # When using DeepSpeed, the forward pass is clean.
                 outputs = model(**batch, labels=labels)
                 loss = outputs.loss
 
-
-            # Scale the loss for mixed precision and perform the backward pass
-            scaler.scale(loss / args.gradient_accumulation_steps).backward()
-
-            if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader):
-                # Unscale gradients before clipping
-                scaler.unscale_(optimizer)
-                
-                if args.max_grad_norm > 0:
+            if args.deepspeed:
+                model.backward(loss)
+                model.step()
+            else:
+                scaler.scale(loss / args.gradient_accumulation_steps).backward()
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
 
-                # Scaler-aware optimizer step
-                scaler.step(optimizer)
-                scaler.update()
-
-                optimizer.zero_grad()
-                lr_scheduler.step()
+            if (step + 1) % args.gradient_accumulation_steps == 0:
                 completed_steps += 1
 
-                # --- Logging and Checkpointing ---
-                # These actions happen only on an optimization step
-                if is_main_process(args.single_gpu):
-                    current_loss = loss.item()
-                    progress_bar.update(1)
-                    progress_bar.set_postfix(loss=f"{current_loss:.4f}", lr=f"{lr_scheduler.get_last_lr()[0]:.2e}")
+            # --- Logging and Checkpointing ---
+            # These actions happen only on an optimization step
+            if is_main_process(args.single_gpu):
+                current_loss = loss.item()
+                progress_bar.update(1)
+                # Get learning rate correctly depending on whether DeepSpeed is used
+                if args.deepspeed:
+                    current_lr = model.get_lr()[0]
+                else:
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                progress_bar.set_postfix(loss=f"{current_loss:.4f}", lr=f"{current_lr:.2e}")
 
-                if completed_steps % args.logging_steps == 0 and is_main_process(args.single_gpu):
-                    log_stats = {
-                        "train/loss": current_loss,
-                        "train/learning_rate": lr_scheduler.get_last_lr()[0],
-                        "tokens_processed": tokens_processed,
-                        "epoch": epoch,
-                    }
-                    wandb.log(log_stats, step=completed_steps)
+            if completed_steps % args.logging_steps == 0 and is_main_process(args.single_gpu):
+                if args.deepspeed:
+                    current_lr = model.get_lr()[0]
+                else:
+                    current_lr = lr_scheduler.get_last_lr()[0]
+
+                log_stats = {
+                    "train/loss": current_loss,
+                    "train/learning_rate": current_lr,
+                    "tokens_processed": tokens_processed,
+                    "epoch": epoch,
+                }
+                wandb.log(log_stats, step=completed_steps)
+
+
+
 
                 if completed_steps > 0 and completed_steps % args.checkpointing_steps == 0 and is_main_process(args.single_gpu):
-                    save_checkpoint(model, optimizer, lr_scheduler, tokenizer, args, completed_steps, epoch, tokens_processed)
+                    save_checkpoint(model, optimizer, lr_scheduler, tokenizer,args, completed_steps, epoch, tokens_processed)
 
                 # --- Evaluation ---
                 # All processes must participate in evaluation to avoid deadlocks.
@@ -620,6 +763,10 @@ def main():
                 logger.info(f"Successfully pushed to {args.hub_model_id}")
             except Exception as e:
                 logger.error(f"Failed to push final model to Hub: {e}")
+
+    # Finish the W&B run to ensure all data is synced and processes are cleaned up
+    if is_main_process(args.single_gpu):
+        wandb.finish()
 
     if not args.single_gpu:
         cleanup_distributed()

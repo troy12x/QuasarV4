@@ -1,4 +1,11 @@
-# === Stable Dependencies for QuasarV4 (Validated) ===
+# === Core Dependencies for QuasarV4 ===
+torch
+transformers
+datasets
+accelerate
+wandb
+tqdm
+bitsandbytes
 # This is a known-good set of versions that are compatible with each other.
 
 # Core PyTorch Libraries
