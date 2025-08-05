@@ -29,11 +29,6 @@ from .moe import MoELayer, Expert
 
 from tqdm import tqdm
 
-try:
-    from torchdiffeq import odeint
-except ImportError:
-    raise ImportError("torchdiffeq is not installed. Please install it with `pip install torchdiffeq`")
-
 # --- 1. Configuration Class ---
 class LNNConfig(PretrainedConfig):
     """
