@@ -26,6 +26,7 @@ from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 from .pmb import ParameterMemoryBank
 from .moe import MoELayer, Expert
+import lnn_cuda
 
 from tqdm import tqdm
 
@@ -47,6 +48,9 @@ class LNNConfig(PretrainedConfig):
         dt=0.2, # Step size for the fixed-step Euler solver.
         initializer_range=0.02,
         dropout=0.1,
+        state_clamp_value: float = 100.0, # Value for state clamping
+        derivative_clamp_value: float = 10.0, # Value for derivative clamping
+        tau_floor: float = 1.0, # Floor for the time constant to prevent instability,
         use_pmb=False,
         pmb_num_blocks=1024,
         pmb_slots_per_block=4096,
@@ -67,6 +71,9 @@ class LNNConfig(PretrainedConfig):
         self.activation = activation
         self.initializer_range = initializer_range
         self.dropout = dropout
+        self.state_clamp_value = state_clamp_value
+        self.derivative_clamp_value = derivative_clamp_value
+        self.tau_floor = tau_floor
         self.use_pmb = use_pmb
         self.pmb_num_blocks = pmb_num_blocks
         self.pmb_slots_per_block = pmb_slots_per_block
@@ -100,6 +107,8 @@ class LNNCell(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.lambda_res = config.lambda_res
+        self.derivative_clamp_value = config.derivative_clamp_value
+        self.tau_floor = config.tau_floor
         
         # Core LNN parameters
         self.W = nn.Parameter(torch.empty(config.hidden_size, config.hidden_size))
@@ -123,9 +132,8 @@ class LNNCell(nn.Module):
         """Core ODE dynamics calculation for a single discrete step."""
         # 1. Compute Input-Dependent Time Constant (tau)
         tau_control = self.tau_w_h(h) + self.tau_w_u(u) + self.tau_b
-        # Increased the floor from 0.01 to 1.0 to prevent division by a near-zero
-        # number, which is a common cause of NaN in bf16.
-        tau_positive = F.softplus(tau_control) + 1.0
+        # Use the configurable floor for the time constant.
+        tau_positive = F.softplus(tau_control) + self.tau_floor
 
         # 2. Compute State Update
         decay_term = -h / tau_positive
@@ -137,7 +145,7 @@ class LNNCell(nn.Module):
             dx_dt = dx_dt + self.lambda_res * u
 
         # 3. Stability: Clip the derivative
-        dx_dt = torch.clamp(dx_dt, -10, 10)
+        dx_dt = torch.clamp(dx_dt, -self.derivative_clamp_value, self.derivative_clamp_value)
         return dx_dt
 
 # --- 4. LNN Block (Layer + Residual) ---
@@ -149,24 +157,42 @@ class LNNBlock(nn.Module):
         self.dt = config.dt
         self.cell = LNNCell(config)
         self.ln = nn.LayerNorm(config.hidden_size)
+        self.state_clamp_value = config.state_clamp_value
+
+        # Learnable parameter for adaptive state clamping
+        self.state_clamp_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Processes the entire sequence using a fixed-step Euler integration loop,
-        starting from a given hidden state h.
-        This version is optimized to be JIT-friendly by pre-allocating the output tensor.
+        Processes the entire sequence using a custom CUDA kernel for the element-wise
+        recurrent updates. It uses the parameters from the contained LNNCell.
         """
         seq_len = x.size(1)
-        # Pre-allocate tensor for outputs to avoid slow list appends
-        outputs = torch.empty(x.size(0), seq_len, self.hidden_size, device=x.device)
+        outputs = torch.empty_like(x)
 
         for t in range(seq_len):
-            u = x[:, t, :]
-            dx_dt = self.cell(h, u)
-            h = h + self.dt * dx_dt
-            # Clamp the hidden state to prevent runaway values, a common
-            # source of instability in recurrent models.
-            h = torch.clamp(h, -100, 100)
+            u = x[:, t, :] # Input for the current timestep
+
+            # --- Calculations using LNNCell's parameters ---
+            activation_in = F.linear(h, self.cell.W) + F.linear(u, self.cell.U) + self.cell.b
+
+            tau_control = self.cell.tau_w_h(h) + self.cell.tau_w_u(u) + self.cell.tau_b
+            tau = F.softplus(tau_control) + self.cell.tau_floor
+            # --- End of calculations ---
+
+            # Get the adaptive clamp bound
+            clamp_bound = self.state_clamp_value * torch.abs(self.state_clamp_scale)
+
+            # Call the custom CUDA kernel for the element-wise update
+            # h is updated in-place by the kernel
+            h = lnn_cuda.forward(
+                h, 
+                activation_in,
+                tau,
+                self.dt,
+                clamp_bound.item(),
+                self.cell.derivative_clamp_value
+            )
             outputs[:, t, :] = h
 
         # Add residual connection and layer norm
@@ -190,10 +216,6 @@ class LNNModel(PreTrainedModel, GenerationMixin):
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.blocks = nn.ModuleList([LNNBlock(config) for _ in range(config.num_hidden_layers)])
         
-        # JIT-compile the LNNBlocks for a significant performance boost
-        # Disabling JIT as a test, as it can sometimes cause unexpected memory allocation issues with recurrent loops.
-        # for i in range(len(self.blocks)):
-        #     self.blocks[i] = torch.jit.script(self.blocks[i])
 
         self.ln_final = nn.LayerNorm(config.hidden_size, eps=1e-5)
         
