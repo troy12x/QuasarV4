@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 """
-Small-Scale Pretraining Script for TrueEvolving Attention Architecture
-Test on RTX 3050 single GPU before scaling to multi-GPU setup
-
 TRANSFORMER BOTTLENECKS WE'RE SOLVING:
 1. QUADRATIC MEMORY SCALING: O(n²) attention becomes O(n) with temporal evolution
 2. CONTEXT LENGTH LIMITS: Current models break at 2K-8K tokens, we aim for INFINITE
 3. LONG-RANGE DEPENDENCIES: Standard attention degrades, ours IMPROVES with length
 4. TRAINING INSTABILITY: Gradient explosion at long sequences, our evolution stabilizes
 5. INFERENCE SPEED: KV-cache grows linearly, our memory decays exponentially
-
-THIS WILL CHANGE THE WORLD BY:
-- Enabling truly long-form reasoning (novels, codebases, conversations)
-- Making AI remember entire conversations without forgetting
-- Allowing models to process infinite documents without chunking
-- Creating the first O(n) attention that actually works better than O(n²)
 """
 
 import torch
