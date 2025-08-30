@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
+Small-Scale Pretraining Script for TrueEvolving Attention Architecture
+Test on RTX 3050 single GPU before scaling to multi-GPU setup
+
 TRANSFORMER BOTTLENECKS WE'RE SOLVING:
 1. QUADRATIC MEMORY SCALING: O(n²) attention becomes O(n) with temporal evolution
 2. CONTEXT LENGTH LIMITS: Current models break at 2K-8K tokens, we aim for INFINITE
 3. LONG-RANGE DEPENDENCIES: Standard attention degrades, ours IMPROVES with length
 4. TRAINING INSTABILITY: Gradient explosion at long sequences, our evolution stabilizes
 5. INFERENCE SPEED: KV-cache grows linearly, our memory decays exponentially
+
+THIS WILL CHANGE THE WORLD BY:
+- Enabling truly long-form reasoning (novels, codebases, conversations)
+- Making AI remember entire conversations without forgetting
+- Allowing models to process infinite documents without chunking
+- Creating the first O(n) attention that actually works better than O(n²)
 """
 
 import torch
@@ -215,18 +224,17 @@ class TrueEvolvingLanguageModel(nn.Module):
 class TextDataset(Dataset):
     """Dataset for loading and tokenizing text data with caching and mixed dataset support"""
     
-    def __init__(self, tokenizer, max_length, num_samples=5000, mix_dataset=False, dataset_ratios=[1.0]):
+    def __init__(self, tokenizer, max_length, mix_dataset=False, dataset_ratios=[1.0]):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.num_samples = num_samples
         self.mix_dataset = mix_dataset
         self.dataset_ratios = dataset_ratios
         
         # Create cache key based on tokenizer, parameters, and dataset configuration
         if mix_dataset:
-            cache_key = f"{tokenizer.name_or_path}_{max_length}_{num_samples}_mixed_{'-'.join(map(str, dataset_ratios))}"
+            cache_key = f"{tokenizer.name_or_path}_{max_length}_mixed_{'-'.join(map(str, dataset_ratios))}"
         else:
-            cache_key = f"{tokenizer.name_or_path}_{max_length}_{num_samples}_single"
+            cache_key = f"{tokenizer.name_or_path}_{max_length}_single"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
         
         # Cache directory and file path
@@ -250,7 +258,7 @@ class TextDataset(Dataset):
             logger.info(f"🔥 Creating mixed dataset with ratios {dataset_ratios}")
             self.tokenized_samples = self._load_mixed_datasets()
         else:
-            logger.info(f"🔥 Tokenizing {num_samples} texts with {tokenizer.name_or_path} from OpenWebText...")
+            logger.info(f"🔥 Tokenizing texts with {tokenizer.name_or_path} from OpenWebText...")
             self.tokenized_samples = self._load_single_dataset()
         
         # Save to cache
@@ -263,26 +271,24 @@ class TextDataset(Dataset):
             logger.warning(f"Failed to save cache: {e}")
     
     def _load_single_dataset(self):
-        """Load single dataset (using C4 dataset as alternative)"""
+        """Load single dataset (using Ultra-FineWeb-1B)"""
         try:
-            # Use C4 dataset as it's well-supported and similar to OpenWebText
-            dataset = load_dataset("Samee-ur/tinystories_instruction_finetuning_with_pretrainingdata", split="train", streaming=True)
+            # Use Ultra-FineWeb-1B dataset - high quality web data
+            dataset = load_dataset("sumuks/Ultra-FineWeb-1B", split="train")
             
             texts = []
-            for i, example in enumerate(dataset):
-                if i >= self.num_samples:
-                    break
-                text = example['text']
+            for example in dataset:
+                text = example['content']  # Uses 'content' column
                 if len(text.strip()) > 50:  # Filter out very short texts
                     texts.append(text)
             
             if deepspeed.comm.get_rank() == 0:
-                logger.info(f"✅ Loaded {len(texts)} samples from TinyStories dataset")
+                logger.info(f"✅ Loaded {len(texts)} samples from Ultra-FineWeb-1B dataset")
             return self._tokenize_texts(texts)
             
         except Exception as e:
-            logger.error(f"Failed to load C4 dataset: {e}")
-            raise RuntimeError("Could not load C4 dataset. Please check your internet connection or dataset availability.")
+            logger.error(f"Failed to load Ultra-FineWeb-1B dataset: {e}")
+            raise RuntimeError("Could not load Ultra-FineWeb-1B dataset. Please check your internet connection or dataset availability.")
     
     def _load_mixed_datasets(self):
         """Load and mix multiple datasets"""
@@ -291,71 +297,71 @@ class TextDataset(Dataset):
             logger.warning("Mixed dataset currently supports exactly 2 datasets, using default ratios")
             self.dataset_ratios = [0.7, 0.3]
         
-        samples_dataset1 = int(self.num_samples * self.dataset_ratios[0])
-        samples_dataset2 = int(self.num_samples * self.dataset_ratios[1])
+        # Load all available samples with dataset ratios for mixing
         
         if deepspeed.comm.get_rank() == 0:
-            logger.info(f"📊 Dataset 1 (Synthetic): {samples_dataset1} samples ({self.dataset_ratios[0]*100:.1f}%)")
-            logger.info(f"📊 Dataset 2 (ChatGPT Prompts): {samples_dataset2} samples ({self.dataset_ratios[1]*100:.1f}%)")
+            logger.info(f"📊 Dataset mixing ratios: {self.dataset_ratios[0]*100:.1f}% / {self.dataset_ratios[1]*100:.1f}%")
         
         all_texts = []
         
-        # Load Dataset 1: Synthetic pretraining data
+        # Load Dataset 1: MegaMath Web Pro
         if deepspeed.comm.get_rank() == 0:
-            logger.info("Loading synthetic pretraining dataset...")
+            logger.info("Loading MegaMath Web Pro dataset...")
         try:
-            dataset1 = load_dataset("Gaoj124/pretraining_synthetic_short", split="train", streaming=True)
-            for i, example in enumerate(dataset1):
-                if i >= samples_dataset1:
-                    break
-                text = example['text']
+            dataset1 = load_dataset("semran1/megamath-web-pro", split="train")
+            dataset1_texts = []
+            for example in dataset1:
+                text = example['text']  # Uses 'text' column
                 if len(text.strip()) > 50:
-                    all_texts.append(text)
+                    dataset1_texts.append(text)
+            
+            # Take proportion based on ratio
+            dataset1_count = int(len(dataset1_texts) * self.dataset_ratios[0])
+            all_texts.extend(dataset1_texts[:dataset1_count])
+            
         except Exception as e:
-            logger.error(f"Failed to load C4 dataset: {e}")
-            raise RuntimeError("Could not load C4 dataset for mixed training. Please check your internet connection.")
-        
-        # Load Dataset 2: ChatGPT Prompts
-        if deepspeed.comm.get_rank() == 0:
-            logger.info("Loading ChatGPT Prompts dataset...")
-        try:
-            dataset2 = load_dataset("fka/awesome-chatgpt-prompts", split="train")
-            for i, example in enumerate(dataset2):
-                if i >= samples_dataset2:
-                    break
-                # Use 'act' and 'prompt' columns, combine them under 'text'
-                if 'act' in example and 'prompt' in example:
-                    text = f"Act as {example['act']}: {example['prompt']}"
-                elif 'prompt' in example:
-                    text = example['prompt']
-                elif 'text' in example:
-                    text = example['text']
-                else:
-                    continue
-                
-                if len(text.strip()) > 50:
-                    all_texts.append(text)
-        except Exception as e:
-            logger.warning(f"Failed to load ChatGPT prompts dataset: {e}")
-            logger.info("Falling back to more C4 samples...")
-            # Fallback: load more from C4 or synthetic data
+            logger.warning(f"Could not load MegaMath dataset: {e}")
+            # Fallback to Ultra-FineWeb-1B
             try:
-                for i, example in enumerate(dataset1):
-                    if len(all_texts) >= self.num_samples:
-                        break
-                    text = example['text']
+                dataset1 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train")
+                dataset1_texts = []
+                for example in dataset1:
+                    text = example['content']  # Uses 'content' column
                     if len(text.strip()) > 50:
-                        all_texts.append(text)
-            except:
-                logger.warning("Could not load additional C4 samples, continuing with available data...")
+                        dataset1_texts.append(text)
+                
+                dataset1_count = int(len(dataset1_texts) * self.dataset_ratios[0])
+                all_texts.extend(dataset1_texts[:dataset1_count])
+                
+            except Exception as e2:
+                logger.error(f"Could not load Ultra-FineWeb-1B dataset either: {e2}")
+                raise RuntimeError("Could not load fallback dataset for mixed training. Please check your internet connection.")
         
-        # Shuffle the mixed dataset
+        # Load Dataset 2: Ultra-FineWeb-1B
+        if deepspeed.comm.get_rank() == 0:
+            logger.info("Loading Ultra-FineWeb-1B dataset...")
+        try:
+            dataset2 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train")
+            dataset2_texts = []
+            for example in dataset2:
+                text = example['content']  # Uses 'content' column
+                if len(text.strip()) > 50:
+                    dataset2_texts.append(text)
+            
+            # Take proportion based on ratio
+            dataset2_count = int(len(all_texts) * self.dataset_ratios[1] / self.dataset_ratios[0])
+            all_texts.extend(dataset2_texts[:dataset2_count])
+            
+        except Exception as e:
+            logger.warning(f"Could not load Ultra-FineWeb-1B dataset: {e}")
+        
+        # Shuffle the combined dataset
         import random
         random.shuffle(all_texts)
         
         if deepspeed.comm.get_rank() == 0:
             logger.info(f"🎯 Mixed dataset created with {len(all_texts)} total samples")
-        return self._tokenize_texts(all_texts[:self.num_samples])
+        return self._tokenize_texts(all_texts)
     
     def _tokenize_texts(self, texts):
         """Tokenize list of texts"""
@@ -587,14 +593,14 @@ def main():
                        help='Comma-separated ratios for mixed datasets (e.g., 0.7,0.3)')
     args = parser.parse_args()
     
-    # Configuration for multi-GPU training with DeepSpeed
+    # Configuration for multi-GPU training with DeepSpeed - 4B Parameter Model
     config = {
-        'vocab_size': 102400,  # DeepSeek-V3 vocab size
-        'd_model': 512,       
-        'n_heads': 8,
-        'n_layers': 6,        
-        'd_ff': 2048,
-        'max_seq_len': 1024,  
+        'vocab_size': 129280,  # DeepSeek-V3 vocab size
+        'd_model': 2048,      # Scaled up for 4B parameters
+        'n_heads': 32,        # Scaled up proportionally
+        'n_layers': 24,       # Scaled up for 4B parameters
+        'd_ff': 8192,         # 4x d_model (standard ratio)
+        'max_seq_len': 2048,  # Increased sequence length
         'dropout': 0.1,
         'batch_size': 4,      # Per-GPU batch size (DeepSpeed handles global batching)
         'learning_rate': 3e-4,
@@ -602,8 +608,7 @@ def main():
         'warmup_steps': 1000,
         'weight_decay': 0.01,
         'save_every': 100,    # Save checkpoint every N steps
-        'eval_every': 50,     # Evaluate every N steps
-        'max_samples': 5000,  
+        'eval_every': 50,     # Evaluate every N steps  
         'val_split': 0.1,
         'logging_steps': 1,   # Log every step to wandb
         'checkpoint_dir': './checkpoints',  # Directory for checkpoints
@@ -687,17 +692,17 @@ def main():
     if config['mix_dataset']:
         logger.info(f"🎯 Using mixed dataset mode with ratios: {config['dataset_ratios']}")
         train_dataset = TextDataset(
-            tokenizer, config['max_seq_len'], config['max_samples'], 
+            tokenizer, config['max_seq_len'], 
             mix_dataset=True, dataset_ratios=config['dataset_ratios']
         )
         val_dataset = TextDataset(
-            tokenizer, config['max_seq_len'], config['max_samples'] // 10,
+            tokenizer, config['max_seq_len'],
             mix_dataset=True, dataset_ratios=config['dataset_ratios']
         )
     else:
         logger.info("📖 Using single dataset mode (OpenWebText)")
-        train_dataset = TextDataset(tokenizer, config['max_seq_len'], config['max_samples'])
-        val_dataset = TextDataset(tokenizer, config['max_seq_len'], config['max_samples'] // 10)
+        train_dataset = TextDataset(tokenizer, config['max_seq_len'])
+        val_dataset = TextDataset(tokenizer, config['max_seq_len'])
     
     # Create dataloaders
     train_dataloader = DataLoader(
