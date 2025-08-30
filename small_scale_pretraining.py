@@ -831,47 +831,7 @@ def main():
     except Exception as e:
         logger.warning(f"DeepSpeed cleanup failed: {e}")
 
-    # Test context scaling
-    logger.info("\n🧪 TESTING CONTEXT SCALING CAPABILITY...")
-    test_context_scaling(model, tokenizer, device)
-    
     logger.info("\n🌍 READY TO CHANGE THE WORLD!")
-
-def test_context_scaling(model, tokenizer, device):
-    """Test how the model handles increasing context lengths"""
-    model.eval()
-    
-    test_lengths = [512, 1024, 1536, 2048]
-    base_text = "The future of artificial intelligence depends on better attention mechanisms. " * 10
-    
-    for length in test_lengths:
-        try:
-            # Create text of target length
-            text = (base_text * (length // len(tokenizer.encode(base_text)) + 1))[:length*4]
-            tokens = tokenizer.encode(text, max_length=length, truncation=True)
-            
-            if len(tokens) < 10:
-                continue
-                
-            input_ids = torch.tensor([tokens[:-1]], device=device)
-            targets = torch.tensor([tokens[1:]], device=device)
-            
-            start_time = time.time()
-            
-            with torch.no_grad():
-                logits, loss = model(input_ids, targets)
-            
-            end_time = time.time()
-            
-            memory_used = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-            
-            logger.info(f"Length {len(tokens):4d}: Loss {loss.item():.4f}, "
-                       f"Time {end_time-start_time:.2f}s, Memory {memory_used:.2f}GB")
-            
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            logger.info(f"Length {length}: FAILED - {str(e)[:50]}")
 
 if __name__ == "__main__":
     main()
