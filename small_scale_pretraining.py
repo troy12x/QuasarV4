@@ -274,7 +274,7 @@ class TextDataset(Dataset):
         """Load single dataset (using Ultra-FineWeb-1B)"""
         try:
             # Use Ultra-FineWeb-1B dataset - high quality web data
-            dataset = load_dataset("sumuks/Ultra-FineWeb-1B", split="train")
+            dataset = load_dataset("sumuks/Ultra-FineWeb-1B", split="train", num_proc=128)
             
             texts = []
             for example in dataset:
@@ -308,22 +308,36 @@ class TextDataset(Dataset):
         if deepspeed.comm.get_rank() == 0:
             logger.info("Loading MegaMath Web Pro dataset...")
         try:
-            dataset1 = load_dataset("semran1/megamath-web-pro", split="train")
+            dataset1 = load_dataset("semran1/megamath-web-pro", split="train", num_proc=128)
+            if deepspeed.comm.get_rank() == 0:
+                logger.info(f"📊 MegaMath dataset loaded, total samples: {len(dataset1)}")
+                logger.info("🔄 Processing MegaMath samples...")
+            
             dataset1_texts = []
-            for example in dataset1:
+            for i, example in enumerate(dataset1):
                 text = example['text']  # Uses 'text' column
                 if len(text.strip()) > 50:
                     dataset1_texts.append(text)
+                
+                # Log progress every 10k samples
+                if deepspeed.comm.get_rank() == 0 and (i + 1) % 10000 == 0:
+                    logger.info(f"📈 Processed {i+1:,}/{len(dataset1):,} MegaMath samples ({(i+1)/len(dataset1)*100:.1f}%)")
+            
+            if deepspeed.comm.get_rank() == 0:
+                logger.info(f"✅ MegaMath processing complete: {len(dataset1_texts):,} valid samples")
             
             # Take proportion based on ratio
             dataset1_count = int(len(dataset1_texts) * self.dataset_ratios[0])
             all_texts.extend(dataset1_texts[:dataset1_count])
             
+            if deepspeed.comm.get_rank() == 0:
+                logger.info(f"📊 Using {dataset1_count:,} MegaMath samples ({self.dataset_ratios[0]*100:.1f}%)")
+            
         except Exception as e:
             logger.warning(f"Could not load MegaMath dataset: {e}")
             # Fallback to Ultra-FineWeb-1B
             try:
-                dataset1 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train")
+                dataset1 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train", num_proc=128)
                 dataset1_texts = []
                 for example in dataset1:
                     text = example['content']  # Uses 'content' column
@@ -341,16 +355,30 @@ class TextDataset(Dataset):
         if deepspeed.comm.get_rank() == 0:
             logger.info("Loading Ultra-FineWeb-1B dataset...")
         try:
-            dataset2 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train")
+            dataset2 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train", num_proc=128)
+            if deepspeed.comm.get_rank() == 0:
+                logger.info(f"📊 Ultra-FineWeb dataset loaded, total samples: {len(dataset2)}")
+                logger.info("🔄 Processing Ultra-FineWeb samples...")
+            
             dataset2_texts = []
-            for example in dataset2:
+            for i, example in enumerate(dataset2):
                 text = example['content']  # Uses 'content' column
                 if len(text.strip()) > 50:
                     dataset2_texts.append(text)
+                
+                # Log progress every 50k samples (larger dataset)
+                if deepspeed.comm.get_rank() == 0 and (i + 1) % 50000 == 0:
+                    logger.info(f"📈 Processed {i+1:,}/{len(dataset2):,} Ultra-FineWeb samples ({(i+1)/len(dataset2)*100:.1f}%)")
+            
+            if deepspeed.comm.get_rank() == 0:
+                logger.info(f"✅ Ultra-FineWeb processing complete: {len(dataset2_texts):,} valid samples")
             
             # Take proportion based on ratio
             dataset2_count = int(len(all_texts) * self.dataset_ratios[1] / self.dataset_ratios[0])
             all_texts.extend(dataset2_texts[:dataset2_count])
+            
+            if deepspeed.comm.get_rank() == 0:
+                logger.info(f"📊 Using {dataset2_count:,} Ultra-FineWeb samples ({self.dataset_ratios[1]*100:.1f}%)")
             
         except Exception as e:
             logger.warning(f"Could not load Ultra-FineWeb-1B dataset: {e}")
@@ -364,34 +392,74 @@ class TextDataset(Dataset):
         return self._tokenize_texts(all_texts)
     
     def _tokenize_texts(self, texts):
-        """Tokenize list of texts"""
-        tokenized_samples = []
+        """Tokenize list of texts efficiently with chunked processing"""
+        if deepspeed.comm.get_rank() == 0:
+            logger.info(f"🔤 Starting chunked tokenization of {len(texts):,} texts...")
         
-        for text in texts:
-            # Tokenize text
-            tokens = self.tokenizer(
-                text,
-                max_length=self.max_length,
-                truncation=True,
-                padding='max_length',
-                return_tensors='pt'
-            )
+        tokenized_samples = []
+        chunk_size = 10000  # Process 10K texts at a time
+        
+        for chunk_start in range(0, len(texts), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(texts))
+            chunk_texts = texts[chunk_start:chunk_end]
             
-            input_ids = tokens['input_ids'].squeeze()
+            # Log progress
+            if deepspeed.comm.get_rank() == 0:
+                progress = chunk_end / len(texts) * 100
+                logger.info(f"🔤 Processing chunk {chunk_start:,}-{chunk_end:,} ({progress:.1f}%)")
             
-            # Create input and target (shifted by 1 for language modeling)
-            if len(input_ids) > 1:
-                inputs = input_ids[:-1]
-                targets = input_ids[1:]
-                tokenized_samples.append((inputs, targets))
+            # Batch tokenize the chunk
+            try:
+                # Use batch tokenization for speed
+                batch_tokens = self.tokenizer(
+                    chunk_texts,
+                    max_length=self.max_length,
+                    truncation=True,
+                    padding=False,
+                    return_tensors=None
+                )['input_ids']
+                
+                # Process each tokenized text in the batch
+                for tokens in batch_tokens:
+                    # Create sliding window samples
+                    if len(tokens) >= self.max_length:
+                        # Create multiple samples from long text
+                        for j in range(0, len(tokens) - self.max_length + 1, self.max_length // 2):
+                            sample = tokens[j:j + self.max_length]
+                            if len(sample) == self.max_length:
+                                tokenized_samples.append(sample)
+                    else:
+                        # Pad short sequences
+                        padded = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+                        tokenized_samples.append(padded)
+                        
+            except Exception as e:
+                if deepspeed.comm.get_rank() == 0:
+                    logger.warning(f"Batch tokenization failed, falling back to individual: {e}")
+                
+                # Fallback to individual tokenization
+                for text in chunk_texts:
+                    tokens = self.tokenizer(
+                        text,
+                        max_length=self.max_length,
+                        truncation=True,
+                        padding=False,
+                        return_tensors=None
+                    )['input_ids']
+                    
+                    if len(tokens) >= self.max_length:
+                        for j in range(0, len(tokens) - self.max_length + 1, self.max_length // 2):
+                            sample = tokens[j:j + self.max_length]
+                            if len(sample) == self.max_length:
+                                tokenized_samples.append(sample)
+                    else:
+                        padded = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+                        tokenized_samples.append(padded)
+        
+        if deepspeed.comm.get_rank() == 0:
+            logger.info(f"✅ Chunked tokenization complete: {len(tokenized_samples):,} tokenized samples created")
         
         return tokenized_samples
-    
-    def __len__(self):
-        return len(self.tokenized_samples)
-    
-    def __getitem__(self, idx):
-        return self.tokenized_samples[idx]
 
 def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
     """Train for one epoch with DeepSpeed and checkpointing"""
@@ -607,8 +675,8 @@ def main():
         'num_epochs': 5,
         'warmup_steps': 1000,
         'weight_decay': 0.01,
-        'save_every': 100,    # Save checkpoint every N steps
-        'eval_every': 50,     # Evaluate every N steps  
+        'save_every': 500,    # Save checkpoint every N steps
+        'eval_every': 100,     # Evaluate every N steps  
         'val_split': 0.1,
         'logging_steps': 1,   # Log every step to wandb
         'checkpoint_dir': './checkpoints',  # Directory for checkpoints
