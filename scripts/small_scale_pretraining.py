@@ -413,6 +413,20 @@ class TextDataset(Dataset):
             logger.info(f"✅ Chunked tokenization complete: {len(tokenized_samples):,} tokenized samples created")
         
         return tokenized_samples
+    
+    def __len__(self):
+        """Return the number of samples in the dataset"""
+        return len(self.tokenized_samples)
+    
+    def __getitem__(self, idx):
+        """Get a single sample from the dataset"""
+        sample = self.tokenized_samples[idx]
+        
+        # Convert to tensor and create input/target pairs
+        input_ids = torch.tensor(sample[:-1], dtype=torch.long)  # All but last token
+        targets = torch.tensor(sample[1:], dtype=torch.long)     # All but first token
+        
+        return input_ids, targets
 
 def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
     """Train for one epoch with DeepSpeed and checkpointing"""
@@ -617,15 +631,15 @@ def main():
     # Configuration for multi-GPU training with DeepSpeed - 4B Parameter Model
     config = {
         'vocab_size': 129280,  # DeepSeek-V3 vocab size
-        'd_model': 2048,      # Scaled up for 4B parameters
-        'n_heads': 32,        # Scaled up proportionally
-        'n_layers': 24,       # Scaled up for 4B parameters
-        'd_ff': 8192,         # 4x d_model (standard ratio)
-        'max_seq_len': 2048,  # Increased sequence length
+        'd_model': 256,       # Reduced for RTX 3090 memory
+        'n_heads': 8,         # Reduced proportionally
+        'n_layers': 6,        # Reduced for memory
+        'd_ff': 1024,         # 4x d_model (standard ratio)
+        'max_seq_len': 256,   # Reduced sequence length
         'dropout': 0.1,
         'batch_size': 4,      # Per-GPU batch size (DeepSpeed handles global batching)
         'learning_rate': 3e-4,
-        'num_epochs': 5,
+        'num_epochs': 1,
         'warmup_steps': 1000,
         'weight_decay': 0.01,
         'save_every': 500,    # Save checkpoint every N steps
@@ -708,22 +722,27 @@ def main():
     else:
         logger.info("Wandb not available, skipping experiment tracking")
     
-    # Create datasets
+    # Create datasets - SINGLE INSTANCE TO AVOID RE-TOKENIZATION
     logger.info("Creating datasets...")
     if config['mix_dataset']:
         logger.info(f"🎯 Using mixed dataset mode with ratios: {config['dataset_ratios']}")
-        train_dataset = TextDataset(
+        full_dataset = TextDataset(
             tokenizer, config['max_seq_len'], 
-            mix_dataset=True, dataset_ratios=config['dataset_ratios']
-        )
-        val_dataset = TextDataset(
-            tokenizer, config['max_seq_len'],
             mix_dataset=True, dataset_ratios=config['dataset_ratios']
         )
     else:
         logger.info("📖 Using single dataset mode (OpenWebText)")
-        train_dataset = TextDataset(tokenizer, config['max_seq_len'])
-        val_dataset = TextDataset(tokenizer, config['max_seq_len'])
+        full_dataset = TextDataset(tokenizer, config['max_seq_len'])
+    
+    # Split dataset for train/val
+    dataset_size = len(full_dataset)
+    val_size = int(dataset_size * config['val_split'])
+    train_size = dataset_size - val_size
+    
+    logger.info(f"📊 Dataset split: {train_size:,} train, {val_size:,} validation")
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size]
+    )
     
     # Create dataloaders
     train_dataloader = DataLoader(
