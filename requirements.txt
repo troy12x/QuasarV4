@@ -8,26 +8,20 @@ tqdm
 bitsandbytes
 # This is a known-good set of versions that are compatible with each other.
 
-# Core PyTorch Libraries
-# Core PyTorch Libraries
-torch==2.1.0
-torchvision==0.16.0
-torchaudio==2.1.0
 
 # Hugging Face Ecosystem
-transformers==4.35.2
-accelerate==0.25.0
-datasets==2.15.0
-huggingface-hub==0.19.4
-safetensors==0.4.1
+transformers
+accelerate
+datasets
+huggingface-hub
+safetensors
 
 # Other Key Dependencies
-fsspec==2023.10.0
-numpy==1.26.2
-scikit-learn==1.3.2
-nltk==3.8.1
-tqdm==4.66.1
-torchdiffeq==0.2.3
-wandb==0.16.1
-networkx==3.1
-
+fsspec
+numpy
+scikit-learn
+nltk
+tqdm
+torchdiffeq
+wandb
+networkx
