@@ -10,11 +10,6 @@ TRANSFORMER BOTTLENECKS WE'RE SOLVING:
 4. TRAINING INSTABILITY: Gradient explosion at long sequences, our evolution stabilizes
 5. INFERENCE SPEED: KV-cache grows linearly, our memory decays exponentially
 
-THIS WILL CHANGE THE WORLD BY:
-- Enabling truly long-form reasoning (novels, codebases, conversations)
-- Making AI remember entire conversations without forgetting
-- Allowing models to process infinite documents without chunking
-- Creating the first O(n) attention that actually works better than O(n²)
 """
 
 import torch
