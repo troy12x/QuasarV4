@@ -257,7 +257,7 @@ class TextDataset(Dataset):
         if deepspeed.comm.get_rank() == 0:
             logger.info("Loading MegaMath Web Pro dataset...")
         try:
-            dataset1 = load_dataset("eyad-silx/Mixed-Pretrain-Working", split="train", num_proc=128)
+            dataset1 = load_dataset("ArnavL/TWTEval-Pretraining-Processed", split="train", num_proc=128)
             if deepspeed.comm.get_rank() == 0:
                 logger.info(f"📊 MegaMath dataset loaded, total samples: {len(dataset1)}")
                 logger.info("🔄 Processing MegaMath samples...")
@@ -314,7 +314,7 @@ class TextDataset(Dataset):
         if deepspeed.comm.get_rank() == 0:
             logger.info("Loading Ultra-FineWeb-1B dataset...")
         try:
-            dataset2 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train", num_proc=128)
+            dataset2 = load_dataset("asuritajuan/labeling_with_pretrained", split="train", num_proc=128)
             if deepspeed.comm.get_rank() == 0:
                 logger.info(f"📊 Ultra-FineWeb dataset loaded, total samples: {len(dataset2)}")
                 logger.info("🔄 Processing Ultra-FineWeb samples...")
@@ -358,14 +358,13 @@ class TextDataset(Dataset):
         if deepspeed.comm.get_rank() == 0:
             logger.info(f"🚀 Fast tokenizing {len(texts):,} texts...")
         
-        # Use fast batch tokenization with parallel processing
+        # Use fast batch tokenization
         batch_tokens = self.tokenizer(
             texts,
             max_length=self.max_length,
             truncation=True,
             padding=False,
-            return_tensors=None,
-            num_proc=8  # Parallel processing
+            return_tensors=None
         )['input_ids']
         
         tokenized_samples = []
