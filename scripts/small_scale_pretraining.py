@@ -604,11 +604,11 @@ def main():
     # Configuration for multi-GPU training with DeepSpeed - 4B Parameter Model
     config = {
         'vocab_size': 129280,  # DeepSeek-V3 vocab size
-        'd_model': 512,       # Reduced for smaller model
-        'n_heads': 8,         # Reduced proportionally
-        'n_layers': 6,        # Reduced for smaller model
-        'd_ff': 2048,         # 4x d_model (standard ratio)
-        'max_seq_len': 512,   # Reduced sequence length
+        'd_model': 768,       # Scaled up for 450M parameters
+        'n_heads': 12,        # Scaled up proportionally (64 dims per head)
+        'n_layers': 12,       # Scaled up for 450M parameters
+        'd_ff': 3072,         # 4x d_model (standard ratio)
+        'max_seq_len': 512,   # Keep sequence length manageable
         'dropout': 0.1,
         'batch_size': 4,      # Per-GPU batch size (DeepSpeed handles global batching)
         'learning_rate': 3e-4,
