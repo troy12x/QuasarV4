@@ -509,7 +509,14 @@ class HierarchicalFlowAnchoring(nn.Module):
                 memory_states = []
                 for pos in recent_checkpoints:
                     checkpoint_id = f"checkpoint_{pos}"
-                    checkpoint_data = self.hierarchical_memory.checkpoint_pmb.pmb.retrieve_direct(checkpoint_id)
+                    # Use proper PMB retrieval method
+                    try:
+                        checkpoint_data = self.hierarchical_memory.checkpoint_pmb.pmb.retrieve(checkpoint_id)
+                    except:
+                        # Fallback to direct access if retrieve method fails
+                        block_idx, slot_idx = self.hierarchical_memory.checkpoint_pmb.pmb._get_hash_indices(checkpoint_id)
+                        slot_data = self.hierarchical_memory.checkpoint_pmb.pmb.pmb[block_idx][slot_idx]
+                        checkpoint_data = slot_data[2] if slot_data else None
                     if checkpoint_data and isinstance(checkpoint_data, dict):
                         stored_state = checkpoint_data.get('state')
                         if stored_state is not None:
