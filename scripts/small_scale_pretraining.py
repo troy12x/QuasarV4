@@ -12,6 +12,13 @@ TRANSFORMER BOTTLENECKS WE'RE SOLVING:
 
 """
 
+import os
+# Set NCCL environment variables for stability before any imports
+os.environ['NCCL_TIMEOUT'] = '1800'  # 30 minutes timeout
+os.environ['NCCL_IB_DISABLE'] = '1'  # Disable InfiniBand
+os.environ['NCCL_P2P_DISABLE'] = '1'  # Disable P2P
+os.environ['NCCL_DEBUG'] = 'WARN'     # Reduce debug verbosity
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -244,7 +251,7 @@ class TextDataset(Dataset):
         # Calculate samples per dataset based on ratios
         if len(self.dataset_ratios) != 2:
             logger.warning("Mixed dataset currently supports exactly 2 datasets, using default ratios")
-            self.dataset_ratios = [0.7, 0.3]
+            self.dataset_ratios = [0.3, 0.7]
         
         # Load all available samples with dataset ratios for mixing
         
@@ -252,38 +259,47 @@ class TextDataset(Dataset):
             logger.info(f"📊 Dataset mixing ratios: {self.dataset_ratios[0]*100:.1f}% / {self.dataset_ratios[1]*100:.1f}%")
         
         all_texts = []
+        max_total_samples = 2000000  # Limit to 1M total samples
         
-        # Load Dataset 1: MegaMath Web Pro
+        # Calculate how many samples to take from each dataset
+        dataset1_limit = int(max_total_samples * self.dataset_ratios[0])  # 30% of 500k = 150k
+        dataset2_limit = int(max_total_samples * self.dataset_ratios[1])  # 70% of 500k = 350k
+        
+        # Load Dataset 1: MegaMath Web Pro (limited to dataset1_limit)
         if deepspeed.comm.get_rank() == 0:
-            logger.info("Loading MegaMath Web Pro dataset...")
+            logger.info(f"Loading MegaMath Web Pro dataset (limit: {dataset1_limit:,} samples)...")
         try:
-            dataset1 = load_dataset("ArnavL/TWTEval-Pretraining-Processed", split="train", num_proc=128)
+            dataset1 = load_dataset("eyad-silx/Mixed-Pretrain-Working", split="train", num_proc=128)
             if deepspeed.comm.get_rank() == 0:
-                logger.info(f"📊 MegaMath dataset loaded, total samples: {len(dataset1)}")
+                logger.info(f"📊 MegaMath dataset loaded, taking {dataset1_limit:,} samples")
                 logger.info("🔄 Processing MegaMath samples...")
             
             dataset1_texts = []
             
-            # Use progress bar for MegaMath processing
+            # Use progress bar for MegaMath processing with limit
             if deepspeed.comm.get_rank() == 0:
-                pbar = tqdm(dataset1, desc="🧮 Processing MegaMath", unit="samples")
+                pbar = tqdm(dataset1, desc="🧮 Processing MegaMath", unit="samples", total=dataset1_limit)
             else:
                 pbar = dataset1
                 
             for example in pbar:
+                if len(dataset1_texts) >= dataset1_limit:
+                    break  # Stop when we reach the limit
+                    
                 text = example['text']  # Uses 'text' column
                 if len(text.strip()) > 50:
                     dataset1_texts.append(text)
+                    
+                if deepspeed.comm.get_rank() == 0:
+                    pbar.update(1)
             
             if deepspeed.comm.get_rank() == 0:
                 logger.info(f"✅ MegaMath processing complete: {len(dataset1_texts):,} valid samples")
             
-            # Take proportion based on ratio
-            dataset1_count = int(len(dataset1_texts) * self.dataset_ratios[0])
-            all_texts.extend(dataset1_texts[:dataset1_count])
+            all_texts.extend(dataset1_texts)
             
             if deepspeed.comm.get_rank() == 0:
-                logger.info(f"📊 Using {dataset1_count:,} MegaMath samples ({self.dataset_ratios[0]*100:.1f}%)")
+                logger.info(f"📊 Using {len(dataset1_texts):,} MegaMath samples ({self.dataset_ratios[0]*100:.1f}%)")
             
         except Exception as e:
             logger.warning(f"Could not load MegaMath dataset: {e}")
@@ -310,37 +326,42 @@ class TextDataset(Dataset):
                 logger.error(f"Could not load Ultra-FineWeb-1B dataset either: {e2}")
                 raise RuntimeError("Could not load fallback dataset for mixed training. Please check your internet connection.")
         
-        # Load Dataset 2: Ultra-FineWeb-1B
+        # Load Dataset 2: Ultra-FineWeb-1B (limited to dataset2_limit)
         if deepspeed.comm.get_rank() == 0:
-            logger.info("Loading Ultra-FineWeb-1B dataset...")
+            logger.info(f"Loading Ultra-FineWeb-1B dataset (limit: {dataset2_limit:,} samples)...")
         try:
-            dataset2 = load_dataset("asuritajuan/labeling_with_pretrained", split="train", num_proc=128)
+            dataset2 = load_dataset("sumuks/Ultra-FineWeb-1B", split="train", num_proc=128)
             if deepspeed.comm.get_rank() == 0:
-                logger.info(f"📊 Ultra-FineWeb dataset loaded, total samples: {len(dataset2)}")
+                logger.info(f"📊 Ultra-FineWeb dataset loaded, taking {dataset2_limit:,} samples")
                 logger.info("🔄 Processing Ultra-FineWeb samples...")
             
             dataset2_texts = []
             
-            # Use progress bar for Ultra-FineWeb processing
+            # Use progress bar for Ultra-FineWeb processing with limit
             if deepspeed.comm.get_rank() == 0:
-                pbar = tqdm(dataset2, desc="🌐 Processing Ultra-FineWeb", unit="samples")
+                pbar = tqdm(dataset2, desc="🌐 Processing Ultra-FineWeb", unit="samples", total=dataset2_limit)
             else:
                 pbar = dataset2
                 
             for example in pbar:
+                if len(dataset2_texts) >= dataset2_limit:
+                    break  # Stop when we reach the limit
+                    
                 text = example['content']  # Uses 'content' column
                 if len(text.strip()) > 50:
                     dataset2_texts.append(text)
+                    
+                if deepspeed.comm.get_rank() == 0:
+                    pbar.update(1)
             
             if deepspeed.comm.get_rank() == 0:
                 logger.info(f"✅ Ultra-FineWeb processing complete: {len(dataset2_texts):,} valid samples")
             
-            # Take proportion based on ratio
-            dataset2_count = int(len(all_texts) * self.dataset_ratios[1] / self.dataset_ratios[0])
-            all_texts.extend(dataset2_texts[:dataset2_count])
+            # Add all collected samples (already limited)
+            all_texts.extend(dataset2_texts)
             
             if deepspeed.comm.get_rank() == 0:
-                logger.info(f"📊 Using {dataset2_count:,} Ultra-FineWeb samples ({self.dataset_ratios[1]*100:.1f}%)")
+                logger.info(f"📊 Using {len(dataset2_texts):,} Ultra-FineWeb samples ({self.dataset_ratios[1]*100:.1f}%)")
             
         except Exception as e:
             logger.warning(f"Could not load Ultra-FineWeb-1B dataset: {e}")
@@ -354,33 +375,93 @@ class TextDataset(Dataset):
         return self._tokenize_texts(all_texts)
     
     def _tokenize_texts(self, texts):
-        """Fast parallel tokenization with batch processing"""
+        """Memory-efficient tokenization with streaming processing"""
         if deepspeed.comm.get_rank() == 0:
-            logger.info(f"🚀 Fast tokenizing {len(texts):,} texts...")
-        
-        # Use fast batch tokenization
-        batch_tokens = self.tokenizer(
-            texts,
-            max_length=self.max_length,
-            truncation=True,
-            padding=False,
-            return_tensors=None
-        )['input_ids']
+            logger.info(f"🚀 Memory-efficient tokenizing {len(texts):,} texts...")
         
         tokenized_samples = []
         
-        # Process tokenized texts
-        for tokens in batch_tokens:
-            if len(tokens) >= self.max_length:
-                # Create sliding window samples for long texts
-                for j in range(0, len(tokens) - self.max_length + 1, self.max_length // 2):
-                    sample = tokens[j:j + self.max_length]
-                    if len(sample) == self.max_length:
-                        tokenized_samples.append(sample)
-            else:
-                # Pad short sequences
-                padded = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
-                tokenized_samples.append(padded)
+        # Use smaller batch size and immediate processing to avoid memory buildup
+        if deepspeed.comm.get_rank() == 0:
+            from tqdm import tqdm
+            import sys
+            import gc
+            
+            batch_size = 1000  # Much smaller batches to prevent OOM
+            
+            pbar = tqdm(range(0, len(texts), batch_size), 
+                       desc="🔤 Tokenizing", 
+                       file=sys.stdout, 
+                       dynamic_ncols=True,
+                       miniters=1)
+            
+            for i in pbar:
+                batch_texts = texts[i:i + batch_size]
+                
+                # Tokenize batch
+                batch_tokens = self.tokenizer(
+                    batch_texts,
+                    max_length=self.max_length,
+                    truncation=True,
+                    padding=False,
+                    return_tensors=None
+                )['input_ids']
+                
+                # Process tokens immediately to avoid memory accumulation
+                for tokens in batch_tokens:
+                    if len(tokens) >= self.max_length:
+                        # Create sliding window samples for long texts
+                        for j in range(0, len(tokens) - self.max_length + 1, self.max_length // 2):
+                            sample = tokens[j:j + self.max_length]
+                            if len(sample) == self.max_length:
+                                tokenized_samples.append(sample)
+                    else:
+                        # Pad short sequences
+                        padded = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+                        tokenized_samples.append(padded)
+                
+                # Clear batch from memory and force garbage collection
+                del batch_texts, batch_tokens
+                if i % 10000 == 0:  # Garbage collect every 10 batches
+                    gc.collect()
+                
+                # Update progress bar description
+                pbar.set_description(f"🔤 Tokenizing ({len(tokenized_samples):,} samples)")
+            
+            pbar.close()
+        else:
+            # Non-rank 0 processes use same memory-efficient approach
+            import gc
+            batch_size = 1000
+            
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                
+                batch_tokens = self.tokenizer(
+                    batch_texts,
+                    max_length=self.max_length,
+                    truncation=True,
+                    padding=False,
+                    return_tensors=None
+                )['input_ids']
+                
+                for tokens in batch_tokens:
+                    if len(tokens) >= self.max_length:
+                        # Create sliding window samples for long texts
+                        for j in range(0, len(tokens) - self.max_length + 1, self.max_length // 2):
+                            sample = tokens[j:j + self.max_length]
+                            if len(sample) == self.max_length:
+                                tokenized_samples.append(sample)
+                    else:
+                        # Pad short sequences
+                        padded = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+                        tokenized_samples.append(padded)
+                
+                # Clear batch from memory
+                del batch_texts, batch_tokens
+                if i % 10000 == 0:
+                    import gc
+                    gc.collect()
         
         if deepspeed.comm.get_rank() == 0:
             logger.info(f"✅ Fast tokenization complete: {len(tokenized_samples):,} samples created")
@@ -411,6 +492,10 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
     current_step = global_step
     best_val_loss = float('inf')
     
+    # Track loss smoothing for stability monitoring
+    loss_history = []
+    loss_smooth_window = 10
+    
     for batch_idx, (input_ids, targets) in enumerate(dataloader):
         input_ids = input_ids.to(device)
         targets = targets.to(device)
@@ -426,13 +511,70 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
             
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         
-        # Backward pass
-        model_engine.backward(loss)
-        model_engine.step()
+        # Backward pass with error handling for NCCL issues
+        try:
+            model_engine.backward(loss)
+        except RuntimeError as e:
+            if "NCCL" in str(e) or "timeout" in str(e).lower():
+                logger.error(f"NCCL communication error: {e}")
+                logger.info("Attempting to recover from NCCL timeout...")
+                # Clear CUDA cache and retry
+                torch.cuda.empty_cache()
+                model_engine.backward(loss)
+            else:
+                raise e
+        
+        # Get gradient norm for monitoring (BEFORE optimizer step to avoid cleared gradients)
+        grad_norm = 0.0
+        try:
+            # Try DeepSpeed API first
+            if hasattr(model_engine, 'get_global_grad_norm'):
+                grad_norm = model_engine.get_global_grad_norm()
+                if grad_norm is None or grad_norm == 0.0:
+                    # Fallback to manual calculation
+                    raise ValueError("DeepSpeed grad norm is None or 0")
+            else:
+                raise ValueError("No DeepSpeed grad norm method")
+        except:
+            # Manual gradient norm calculation
+            total_norm = 0.0
+            param_count = 0
+            model = model_engine.module if hasattr(model_engine, 'module') else model_engine
+            for param in model.parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    param_count += 1
+            
+            if param_count > 0:
+                grad_norm = total_norm ** (1. / 2)
+            else:
+                grad_norm = 0.0
+        
+        # Optimizer step with NCCL error handling (this clears gradients)
+        try:
+            model_engine.step()
+        except RuntimeError as e:
+            if "NCCL" in str(e) or "timeout" in str(e).lower():
+                logger.error(f"NCCL communication error during optimizer step: {e}")
+                logger.info("Attempting to recover from NCCL timeout...")
+                # Clear CUDA cache and retry
+                torch.cuda.empty_cache()
+                model_engine.step()
+            else:
+                raise e
         
         total_loss += loss.item()
         current_step += 1
         total_tokens += input_ids.numel()
+        
+        # Track loss for stability monitoring
+        loss_history.append(loss.item())
+        if len(loss_history) > loss_smooth_window:
+            loss_history.pop(0)
+        
+        # Calculate smoothed loss
+        smoothed_loss = sum(loss_history) / len(loss_history)
         
         # Calculate tokens per second
         elapsed_time = time.time() - epoch_start_time
@@ -441,29 +583,48 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
         # Get learning rate
         lr = model_engine.get_lr()[0] if hasattr(model_engine, 'get_lr') else 0.0
         
-        # Log progress (only rank 0 to avoid duplicate prints)
-        if batch_idx % config.get('log_every', 10) == 0 and deepspeed.comm.get_rank() == 0:
+        # Log progress to console (only rank 0 to avoid duplicate prints)
+        if batch_idx % config.get('log_every', 1) == 0 and deepspeed.comm.get_rank() == 0:
             logger.info(f"Epoch {epoch}, Step {current_step}, Batch {batch_idx}/{num_batches}, "
-                       f"Loss: {loss.item():.4f}, LR: {lr:.6f}, "
+                       f"Loss: {loss.item():.4f} (smooth: {smoothed_loss:.4f}), LR: {lr:.6f}, GradNorm: {grad_norm:.4f}, "
                        f"Tokens: {total_tokens:,}, Tokens/sec: {tokens_per_sec:.0f}")
-            
-            # Log to wandb if available
-            if WANDB_AVAILABLE and wandb.run is not None:
-                try:
-                    wandb.log({
-                        "train_loss": loss.item(),
-                        "learning_rate": lr,
-                        "epoch": epoch,
-                        "step": current_step,
-                        "batch": batch_idx,
-                        "tokens_processed": total_tokens,
-                        "tokens_per_second": tokens_per_sec
-                    })
-                except Exception as e:
-                    logger.warning(f"Wandb logging failed: {e}")
         
-        # Evaluation and checkpointing
-        if current_step % config['eval_every'] == 0:
+        # Log to wandb at configured frequency (separate from console logging)
+        if current_step % config['logging_steps'] == 0 and WANDB_AVAILABLE and wandb.run is not None and deepspeed.comm.get_rank() == 0:
+            try:
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "smoothed_loss": smoothed_loss,
+                    "gradient_norm": grad_norm,
+                    "learning_rate": lr,
+                    "epoch": epoch,
+                    "step": current_step,
+                    "batch": batch_idx,
+                    "tokens_processed": total_tokens,
+                    "tokens_per_second": tokens_per_sec
+                }, step=current_step)  # Explicitly set the step for wandb
+            except Exception as e:
+                logger.warning(f"Wandb logging failed: {e}")
+        
+        # Save checkpoint every save_every steps (independent of evaluation)
+        if current_step % config['save_every'] == 0 and current_step > 0:
+            # Quick validation for checkpoint metadata
+            val_loss = loss.item()  # Use current training loss as proxy
+            
+            # Save checkpoint
+            checkpoint_result = save_checkpoint(model_engine, current_step, epoch, loss.item(), val_loss, 
+                          config, config['checkpoint_dir'])
+            
+            if checkpoint_result is None:
+                if deepspeed.comm.get_rank() == 0:
+                    logger.warning(f"⚠️ Checkpoint save failed at step {current_step}, continuing training...")
+            else:
+                if deepspeed.comm.get_rank() == 0:
+                    logger.info(f"✅ Checkpoint saved successfully")
+                cleanup_old_checkpoints(config['checkpoint_dir'], config['keep_last_n_checkpoints'])
+        
+        # Full evaluation less frequently
+        if current_step % config['eval_every'] == 0 and current_step > 0:
             # Quick validation
             val_loss, val_perplexity = evaluate_model(model_engine, 
                                                     torch.utils.data.DataLoader(
@@ -471,18 +632,59 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
                                                         batch_size=1
                                                     ), device)
             
-            # Save checkpoint
-            if current_step % config['save_every'] == 0:
-                save_checkpoint(model_engine, current_step, epoch, loss.item(), val_loss, 
-                              config, config['checkpoint_dir'])
-                cleanup_old_checkpoints(config['checkpoint_dir'], config['keep_last_n_checkpoints'])
+            # Track best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_checkpoint_path = os.path.join(config['checkpoint_dir'], f"best_model_step_{current_step}")
                 
-                # Track best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_checkpoint_path = os.path.join(config['checkpoint_dir'], f"best_model_step_{current_step}")
-                    model_engine.save_checkpoint(best_checkpoint_path)
+                # Use our fast PyTorch checkpoint saving for best model
+                try:
+                    # Clean up any existing best model checkpoint
+                    if os.path.exists(best_checkpoint_path):
+                        import shutil
+                        shutil.rmtree(best_checkpoint_path)
+                    
+                    # Create directory for best model checkpoint
+                    os.makedirs(best_checkpoint_path, exist_ok=True)
+                    
+                    # Get model, optimizer, scheduler states
+                    model_state = model_engine.module.state_dict() if hasattr(model_engine, 'module') else model_engine.state_dict()
+                    optimizer_state = model_engine.optimizer.state_dict() if hasattr(model_engine, 'optimizer') else None
+                    scheduler_state = model_engine.lr_scheduler.state_dict() if hasattr(model_engine, 'lr_scheduler') else None
+                    
+                    # Create checkpoint data
+                    checkpoint_data = {
+                        'model_state_dict': model_state,
+                        'optimizer_state_dict': optimizer_state,
+                        'scheduler_state_dict': scheduler_state,
+                        'step': current_step,
+                        'epoch': epoch,
+                        'val_loss': val_loss,
+                        'timestamp': time.time(),
+                        'is_best_model': True
+                    }
+                    
+                    # Save checkpoint file
+                    checkpoint_file = os.path.join(best_checkpoint_path, 'pytorch_model.bin')
+                    torch.save(checkpoint_data, checkpoint_file)
+                    
+                    # Save metadata
+                    metadata = {
+                        'step': current_step,
+                        'epoch': epoch,
+                        'val_loss': val_loss,
+                        'timestamp': time.time(),
+                        'checkpoint_type': 'best_model_pytorch',
+                        'is_best_model': True
+                    }
+                    metadata_path = os.path.join(best_checkpoint_path, 'metadata.json')
+                    with open(metadata_path, 'w') as f:
+                        json.dump(metadata, f, indent=2)
+                    
                     logger.info(f"🏆 New best model saved at step {current_step} (val_loss: {val_loss:.4f})")
+                except (OSError, RuntimeError) as e:
+                    logger.warning(f"❌ Failed to save best model checkpoint: {e}")
+                    logger.info(f"🏆 Best validation loss updated to {val_loss:.4f} at step {current_step} (checkpoint save failed)")
     
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
@@ -523,71 +725,309 @@ def evaluate_model(model_engine, dataloader, device):
     return avg_loss, perplexity
 
 def save_checkpoint(model_engine, step, epoch, train_loss, val_loss, config, checkpoint_dir):
-    """Save DeepSpeed checkpoint with metadata"""
+    """Fast hybrid checkpoint saving - PyTorch for speed, DeepSpeed compatibility"""
     if deepspeed.comm.get_rank() == 0:
         # Create checkpoint directory
         os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        # Save DeepSpeed checkpoint
         checkpoint_path = os.path.join(checkpoint_dir, f"step_{step}")
-        model_engine.save_checkpoint(checkpoint_path)
         
-        # Save metadata
-        metadata = {
-            'step': step,
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'config': config,
-            'timestamp': time.time()
-        }
-        
-        metadata_path = os.path.join(checkpoint_path, 'metadata.json')
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        logger.info(f"💾 Saved checkpoint: {checkpoint_path}")
-        return checkpoint_path
+        try:
+            logger.info(f"💾 Saving fast hybrid checkpoint: {checkpoint_path}")
+            start_time = time.time()
+            
+            # Clean up any partial checkpoint
+            if os.path.exists(checkpoint_path):
+                import shutil
+                shutil.rmtree(checkpoint_path)
+                logger.info(f"🧹 Cleaned up partial checkpoint: {checkpoint_path}")
+            
+            # Create checkpoint directory
+            os.makedirs(checkpoint_path, exist_ok=True)
+            
+            # Get model state dict efficiently
+            logger.info(f"🔄 Extracting model state...")
+            if hasattr(model_engine, 'module'):
+                model_state = model_engine.module.state_dict()
+            else:
+                model_state = model_engine.state_dict()
+            
+            # Get optimizer state (only if available and not too large)
+            optimizer_state = None
+            scheduler_state = None
+            
+            try:
+                if hasattr(model_engine, 'optimizer') and model_engine.optimizer is not None:
+                    optimizer_state = model_engine.optimizer.state_dict()
+                    logger.info(f"✅ Extracted optimizer state")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not extract optimizer state: {e}")
+            
+            try:
+                if hasattr(model_engine, 'lr_scheduler') and model_engine.lr_scheduler is not None:
+                    scheduler_state = model_engine.lr_scheduler.state_dict()
+                    logger.info(f"✅ Extracted scheduler state")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not extract scheduler state: {e}")
+            
+            # Create checkpoint data
+            checkpoint_data = {
+                'model_state_dict': model_state,
+                'optimizer_state_dict': optimizer_state,
+                'scheduler_state_dict': scheduler_state,
+                'step': step,
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'timestamp': time.time(),
+                'checkpoint_type': 'hybrid_fast'
+            }
+            
+            # Save model state with atomic write
+            logger.info(f"💾 Writing checkpoint file...")
+            checkpoint_file = os.path.join(checkpoint_path, 'pytorch_model.bin')
+            temp_file = checkpoint_file + '.tmp'
+            
+            # Write to temporary file first
+            torch.save(checkpoint_data, temp_file)
+            
+            # Validate temporary file
+            temp_size = os.path.getsize(temp_file)
+            temp_size_mb = temp_size / (1024 * 1024)
+            
+            if temp_size == 0:
+                raise RuntimeError(f"Temporary checkpoint file is empty: {temp_file}")
+            
+            # Test load temporary file
+            try:
+                test_data = torch.load(temp_file, map_location='cpu')
+                del test_data  # Free memory
+                logger.info(f"✅ Checkpoint validation passed - {temp_size_mb:.1f} MB")
+            except Exception as e:
+                raise RuntimeError(f"Checkpoint validation failed: {e}")
+            
+            # Atomic move to final location
+            import shutil
+            shutil.move(temp_file, checkpoint_file)
+            
+            save_time = time.time() - start_time
+            logger.info(f"✅ Fast checkpoint saved in {save_time:.1f} seconds")
+            
+            # Save metadata
+            metadata = {
+                'step': step,
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'timestamp': time.time(),
+                'save_duration': save_time,
+                'checkpoint_type': 'hybrid_fast',
+                'file_size_mb': temp_size_mb
+            }
+            
+            metadata_path = os.path.join(checkpoint_path, 'metadata.json')
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            logger.info(f"✅ Successfully saved checkpoint: {checkpoint_path}")
+            return checkpoint_path
+                
+        except Exception as e:
+            logger.error(f"💥 Checkpoint save failed: {e}")
+            import traceback
+            logger.error(f"💥 Traceback: {traceback.format_exc()}")
+            
+            # Clean up partial checkpoint
+            if os.path.exists(checkpoint_path):
+                try:
+                    import shutil
+                    shutil.rmtree(checkpoint_path)
+                    logger.info(f"🧹 Cleaned up failed checkpoint: {checkpoint_path}")
+                except:
+                    pass
+            return None
+    
+    # Non-rank 0 processes just wait
     return None
 
-def cleanup_old_checkpoints(checkpoint_dir, keep_last_n=3):
-    """Remove old checkpoints to save disk space"""
-    if deepspeed.comm.get_rank() == 0:
-        checkpoint_pattern = os.path.join(checkpoint_dir, "step_*")
-        checkpoints = glob.glob(checkpoint_pattern)
+def load_checkpoint(model_engine, checkpoint_path):
+    """Load DeepSpeed checkpoint with fallback to PyTorch"""
+    logger.info(f"🔍 LOAD_CHECKPOINT: Starting checkpoint load from {checkpoint_path}")
+    
+    try:
+        # Check what type of checkpoint this is
+        checkpoint_files = os.listdir(checkpoint_path) if os.path.exists(checkpoint_path) else []
+        logger.info(f"📁 LOAD_CHECKPOINT: Checkpoint directory contents: {checkpoint_files}")
         
-        if len(checkpoints) > keep_last_n:
-            # Sort by step number
-            checkpoints.sort(key=lambda x: int(x.split('_')[-1]))
+        # Check for DeepSpeed checkpoint files first
+        deepspeed_files = ['latest', 'zero_pp_rank_0_mp_rank_00_optim_states.pt', 'mp_rank_00_model_states.pt']
+        has_deepspeed = any(f in checkpoint_files for f in deepspeed_files)
+        
+        # Check for PyTorch checkpoint
+        pytorch_file = os.path.join(checkpoint_path, 'pytorch_model.bin')
+        has_pytorch = os.path.exists(pytorch_file)
+        
+        logger.info(f"🔍 LOAD_CHECKPOINT: DeepSpeed files detected: {has_deepspeed}")
+        logger.info(f"🔍 LOAD_CHECKPOINT: PyTorch file detected: {has_pytorch}")
+        
+        if has_deepspeed:
+            # Load DeepSpeed checkpoint
+            logger.info(f"📂 LOAD_CHECKPOINT: Loading DeepSpeed checkpoint from {checkpoint_path}")
             
-            # Remove oldest checkpoints
-            for old_checkpoint in checkpoints[:-keep_last_n]:
+            try:
+                # Use DeepSpeed's native checkpoint loading
+                logger.info(f"🔄 LOAD_CHECKPOINT: Using DeepSpeed load_checkpoint...")
+                load_path, client_state = model_engine.load_checkpoint(checkpoint_path)
+                
+                if load_path is not None:
+                    logger.info(f"✅ LOAD_CHECKPOINT: DeepSpeed checkpoint loaded successfully")
+                    logger.info(f"📊 LOAD_CHECKPOINT: Load path: {load_path}")
+                    logger.info(f"📊 LOAD_CHECKPOINT: Client state: {client_state}")
+                else:
+                    logger.error(f"❌ LOAD_CHECKPOINT: DeepSpeed returned None for load_path")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"❌ LOAD_CHECKPOINT: DeepSpeed checkpoint loading failed: {e}")
+                import traceback
+                logger.error(f"❌ LOAD_CHECKPOINT: Traceback: {traceback.format_exc()}")
+                return None
+            
+        elif has_pytorch:
+            # Fallback to PyTorch checkpoint loading
+            logger.info(f"📂 LOAD_CHECKPOINT: Loading PyTorch checkpoint from {pytorch_file}")
+            
+            # Get file size for debugging
+            file_size = os.path.getsize(pytorch_file) / (1024 * 1024)  # MB
+            logger.info(f"📊 LOAD_CHECKPOINT: Checkpoint file size: {file_size:.1f} MB")
+            
+            # Check if file is empty (corrupted checkpoint)
+            if file_size == 0.0:
+                logger.error(f"❌ LOAD_CHECKPOINT: Checkpoint file is empty (0 bytes) - corrupted save!")
+                return None
+            
+            checkpoint_data = torch.load(pytorch_file, map_location='cpu')
+            logger.info(f"✅ LOAD_CHECKPOINT: Successfully loaded PyTorch checkpoint data")
+            
+            # Load model state
+            if 'model_state_dict' in checkpoint_data:
+                model_state_dict = checkpoint_data['model_state_dict']
+            else:
+                logger.info("Checkpoint appears to be raw model state dict")
+                model_state_dict = checkpoint_data
+            
+            try:
+                logger.info(f"🔄 LOAD_CHECKPOINT: Loading model state dict...")
+                if hasattr(model_engine, 'module'):
+                    missing_keys, unexpected_keys = model_engine.module.load_state_dict(model_state_dict, strict=False)
+                else:
+                    missing_keys, unexpected_keys = model_engine.load_state_dict(model_state_dict, strict=False)
+                
+                logger.info(f"✅ LOAD_CHECKPOINT: Model state loaded successfully")
+                if missing_keys:
+                    logger.warning(f"⚠️ LOAD_CHECKPOINT: Missing keys: {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+                if unexpected_keys:
+                    logger.warning(f"⚠️ LOAD_CHECKPOINT: Unexpected keys: {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
+                    
+            except Exception as e:
+                logger.error(f"❌ LOAD_CHECKPOINT: Failed to load model state: {e}")
+                return None
+        else:
+            logger.error(f"❌ LOAD_CHECKPOINT: No valid checkpoint files found in {checkpoint_path}")
+            logger.error(f"❌ LOAD_CHECKPOINT: Expected DeepSpeed files: {deepspeed_files}")
+            logger.error(f"❌ LOAD_CHECKPOINT: Or PyTorch file: pytorch_model.bin")
+            return None
+        
+        # Load metadata if available
+        metadata_path = os.path.join(checkpoint_path, 'metadata.json')
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                logger.info(f"✅ LOAD_CHECKPOINT: Loaded metadata: {metadata}")
+                return metadata
+            except Exception as e:
+                logger.warning(f"⚠️ LOAD_CHECKPOINT: Failed to load metadata: {e}")
+        
+        # Return default metadata if no metadata file
+        logger.warning(f"⚠️ LOAD_CHECKPOINT: No metadata found, using defaults")
+        return {'step': 0, 'epoch': 0, 'train_loss': 0.0, 'val_loss': 0.0}
+                
+    except Exception as e:
+        logger.error(f"❌ LOAD_CHECKPOINT: Failed to load checkpoint from {checkpoint_path}: {e}")
+        logger.error(f"❌ LOAD_CHECKPOINT: Exception type: {type(e).__name__}")
+        import traceback
+        logger.error(f"❌ LOAD_CHECKPOINT: Traceback: {traceback.format_exc()}")
+        return None
+
+def cleanup_old_checkpoints(checkpoint_dir, keep_last_n=1):
+    """Remove old checkpoints to save disk space - keep only the latest"""
+    if deepspeed.comm.get_rank() == 0:
+        logger.info(f"🧹 Starting checkpoint cleanup - keeping last {keep_last_n} checkpoints")
+        
+        # Clean up regular step checkpoints
+        checkpoint_pattern = os.path.join(checkpoint_dir, "step_*")
+        checkpoints = [p for p in glob.glob(checkpoint_pattern) if os.path.isdir(p) and not p.endswith('.lock')]
+        
+        # Clean up best model checkpoints  
+        best_model_pattern = os.path.join(checkpoint_dir, "best_model_step_*")
+        best_checkpoints = [p for p in glob.glob(best_model_pattern) if os.path.isdir(p)]
+        
+        logger.info(f"📁 Found {len(checkpoints)} step checkpoints and {len(best_checkpoints)} best model checkpoints")
+        
+        # Helper function to extract step number
+        def get_step_number(path):
+            try:
+                basename = os.path.basename(path)
+                if 'best_model_step_' in basename:
+                    return int(basename.split('_')[-1])
+                elif 'step_' in basename:
+                    return int(basename.split('_')[-1])
+                else:
+                    return 0
+            except (ValueError, IndexError):
+                return 0
+        
+        # Clean up regular checkpoints
+        if len(checkpoints) > keep_last_n:
+            checkpoints.sort(key=get_step_number)
+            to_remove = checkpoints[:-keep_last_n]
+            
+            logger.info(f"🗑️  Removing {len(to_remove)} old step checkpoints")
+            for old_checkpoint in to_remove:
                 try:
                     import shutil
                     shutil.rmtree(old_checkpoint)
-                    logger.info(f"🗑️  Removed old checkpoint: {old_checkpoint}")
+                    logger.info(f"🗑️  Removed: {os.path.basename(old_checkpoint)}")
                 except Exception as e:
-                    logger.warning(f"Failed to remove checkpoint {old_checkpoint}: {e}")
-
-def load_checkpoint(checkpoint_path, model_engine):
-    """Load DeepSpeed checkpoint"""
-    try:
-        # Load DeepSpeed checkpoint
-        model_engine.load_checkpoint(checkpoint_path)
+                    logger.warning(f"⚠️  Failed to remove {old_checkpoint}: {e}")
         
-        # Load metadata
-        metadata_path = os.path.join(checkpoint_path, 'metadata.json')
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-            logger.info(f"📂 Loaded checkpoint from step {metadata['step']}, epoch {metadata['epoch']}")
-            return metadata
+        # Clean up best model checkpoints - keep only the latest
+        if len(best_checkpoints) > keep_last_n:
+            best_checkpoints.sort(key=get_step_number)
+            to_remove = best_checkpoints[:-keep_last_n]
+            
+            logger.info(f"🗑️  Removing {len(to_remove)} old best model checkpoints")
+            for old_best in to_remove:
+                try:
+                    import shutil
+                    shutil.rmtree(old_best)
+                    logger.info(f"🗑️  Removed: {os.path.basename(old_best)}")
+                except Exception as e:
+                    logger.warning(f"⚠️  Failed to remove {old_best}: {e}")
+        
+        # Show what's left
+        remaining_checkpoints = glob.glob(checkpoint_pattern) + glob.glob(best_model_pattern)
+        remaining_checkpoints = [p for p in remaining_checkpoints if os.path.isdir(p)]
+        
+        if remaining_checkpoints:
+            remaining_names = [os.path.basename(p) for p in remaining_checkpoints]
+            logger.info(f"✅ Cleanup complete - remaining checkpoints: {remaining_names}")
         else:
-            logger.warning("Checkpoint metadata not found")
-            return None
-    except Exception as e:
-        logger.error(f"Failed to load checkpoint: {e}")
-        return None
+            logger.info(f"✅ Cleanup complete - no checkpoints remaining")
+        
+        # Force garbage collection after cleanup
+        import gc
+        gc.collect()
 
 def main():
     """Main pretraining function with DeepSpeed"""
@@ -599,31 +1039,35 @@ def main():
     parser.add_argument('--mix_dataset', action='store_true', help='Enable mixed dataset training')
     parser.add_argument('--dataset_ratios', type=str, default='0.7,0.3', 
                        help='Comma-separated ratios for mixed datasets (e.g., 0.7,0.3)')
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                       help='Path to checkpoint to resume from (e.g., checkpoints/best_model_step_84000)')
     args = parser.parse_args()
     
     # Configuration for multi-GPU training with DeepSpeed - 4B Parameter Model
     config = {
         'vocab_size': 129280,  # DeepSeek-V3 vocab size
-        'd_model': 768,       # Scaled up for 450M parameters
-        'n_heads': 12,        # Scaled up proportionally (64 dims per head)
-        'n_layers': 12,       # Scaled up for 450M parameters
-        'd_ff': 3072,         # 4x d_model (standard ratio)
-        'max_seq_len': 512,   # Keep sequence length manageable
+        'd_model': 256,       # Scaled down for 20M parameters
+        'n_heads': 8,         # 32 dims per head (256/8)
+        'n_layers': 6,        # Scaled down for 20M parameters
+        'd_ff': 1024,         # 4x d_model (standard ratio)
+        'max_seq_len': 2048,   # Keep sequence length manageable
         'dropout': 0.1,
         'batch_size': 4,      # Per-GPU batch size (DeepSpeed handles global batching)
-        'learning_rate': 3e-4,
+        'learning_rate': 1e-4,
         'num_epochs': 1,
-        'warmup_steps': 1000,
+        'warmup_steps': 100,
         'weight_decay': 0.01,
-        'save_every': 500,    # Save checkpoint every N steps
-        'eval_every': 100,     # Evaluate every N steps  
+        'save_every': 5000,    # Save checkpoint every N steps
+        'eval_every': 1000,     # Evaluate every N steps  
         'val_split': 0.1,
-        'logging_steps': 1,   # Log every step to wandb
+        'logging_steps': 1000,   # Log every step to wandb
+        'log_every': 2,       # Log every step to console
         'checkpoint_dir': './checkpoints',  # Directory for checkpoints
-        'keep_last_n_checkpoints': 3,       # Keep only last N checkpoints
+        'keep_last_n_checkpoints': 1,       # Keep only last N checkpoints
         'mix_dataset': args.mix_dataset,    # Enable mixed dataset training
         'dataset_ratios': [float(x) for x in args.dataset_ratios.split(',')],  # Dataset mixing ratios
-        'deepspeed_config': args.deepspeed_config
+        'deepspeed_config': args.deepspeed_config,
+        'resume_from_checkpoint': args.resume_from_checkpoint  # Checkpoint to resume from
     }
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
@@ -733,21 +1177,10 @@ def main():
         pin_memory=True
     )
     
-    # Setup optimizer and scheduler
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=config['learning_rate'],
-        betas=(0.9, 0.95),
-        weight_decay=0.1
-    )
-    
+    # Note: Optimizer and scheduler are handled by DeepSpeed config
+    # The learning rate schedule is defined in ds_config.json
     total_steps = len(train_dataloader) * config['num_epochs']
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config['learning_rate'],
-        total_steps=total_steps,
-        pct_start=0.1
-    )
+    logger.info(f"Total training steps: {total_steps:,}")
     
     # Training loop
     logger.info("🚀 STARTING PRETRAINING OF WORLD-CHANGING ARCHITECTURE!")
@@ -763,17 +1196,80 @@ def main():
     # Create checkpoint directory
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
     
-    for epoch in range(config['num_epochs']):
-        logger.info(f"Starting epoch {epoch + 1}/{config['num_epochs']}")
+    # Load checkpoint if specified
+    start_epoch = 0
+    global_step = 0
+    if args.resume_from_checkpoint:
+        logger.info("=" * 60)
+        logger.info(f"🔄 CHECKPOINT RESUME REQUESTED")
+        logger.info(f"📁 Checkpoint path: {args.resume_from_checkpoint}")
+        logger.info(f"📂 Path exists: {os.path.exists(args.resume_from_checkpoint)}")
         
-        # Train with checkpointing
-        train_loss, epoch_tokens, global_step = train_epoch(
-            model_engine, train_dataloader, device, epoch + 1, config, global_step
-        )
-        cumulative_tokens += epoch_tokens
+        if os.path.exists(args.resume_from_checkpoint):
+            logger.info(f"📁 CHECKPOINT DEBUG: Directory contents: {os.listdir(args.resume_from_checkpoint)}")
+        else:
+            logger.error(f"❌ CHECKPOINT PATH NOT FOUND: {args.resume_from_checkpoint}")
+            logger.error(f"❌ Current working directory: {os.getcwd()}")
+            logger.error(f"❌ Absolute path would be: {os.path.abspath(args.resume_from_checkpoint)}")
         
-        # Full validation at end of epoch
-        val_loss, val_perplexity = evaluate_model(model_engine, val_dataloader, device)
+        logger.info(f"🚀 CALLING load_checkpoint function...")
+        checkpoint_metadata = load_checkpoint(model_engine, args.resume_from_checkpoint)
+        logger.info(f"🔙 RETURNED from load_checkpoint, result: {checkpoint_metadata}")
+        
+        if checkpoint_metadata:
+            start_epoch = checkpoint_metadata.get('epoch', 0)
+            global_step = checkpoint_metadata.get('step', 0)
+            logger.info(f"✅ CHECKPOINT SUCCESS: Resumed from step {global_step}, epoch {start_epoch}")
+            logger.info(f"📊 CHECKPOINT METADATA: {checkpoint_metadata}")
+        else:
+            logger.error(f"❌ CHECKPOINT FAILED: Could not load from {args.resume_from_checkpoint}")
+            logger.info("🆕 STARTING FROM SCRATCH: Creating new model...")
+            logger.error(f"❌ Failed to load checkpoint from {args.resume_from_checkpoint}")
+            logger.error(f"❌ Starting training from scratch...")
+            logger.error("=" * 60)
+    else:
+        logger.info("🆕 No checkpoint specified - starting fresh training")
+    
+    logger.info(f"🚀 Training will start from epoch {start_epoch}, step {global_step}")
+    logger.info(f"📊 Total steps planned: {total_steps:,}")
+    
+    # Initialize variables to avoid UnboundLocalError
+    train_loss = 0.0
+    val_loss = 0.0
+    
+    # If resuming from checkpoint, continue training within the current epoch
+    if global_step > 0:
+        remaining_steps = total_steps - global_step
+        logger.info(f"🔄 Resuming training - {remaining_steps:,} steps remaining out of {total_steps:,}")
+        
+        if remaining_steps > 0:
+            # Continue training from current step
+            logger.info(f"▶️  Continuing epoch {start_epoch + 1} from step {global_step}")
+            train_loss, epoch_tokens, global_step = train_epoch(
+                model_engine, train_dataloader, device, start_epoch + 1, config, global_step
+            )
+            cumulative_tokens += epoch_tokens
+            
+            # Full validation after continuing
+            val_loss, val_perplexity = evaluate_model(model_engine, val_dataloader, device)
+            logger.info(f"Resumed Training Summary:")
+            logger.info(f"  Train Loss: {train_loss:.4f}")
+            logger.info(f"  Val Loss: {val_loss:.4f}, Perplexity: {val_perplexity:.2f}")
+        else:
+            logger.info(f"✅ Training already complete - reached {global_step}/{total_steps} steps")
+    else:
+        # Fresh training - run full epochs
+        for epoch in range(start_epoch, config['num_epochs']):
+            logger.info(f"Starting epoch {epoch + 1}/{config['num_epochs']}")
+            
+            # Train with checkpointing
+            train_loss, epoch_tokens, global_step = train_epoch(
+                model_engine, train_dataloader, device, epoch + 1, config, global_step
+            )
+            cumulative_tokens += epoch_tokens
+            
+            # Full validation at end of epoch
+            val_loss, val_perplexity = evaluate_model(model_engine, val_dataloader, device)
         
         logger.info(f"Epoch {epoch + 1} Summary:")
         logger.info(f"  Train Loss: {train_loss:.4f}")
@@ -818,12 +1314,36 @@ def main():
     logger.info(f"🔢 Final global step: {global_step}")
     logger.info(f"🏆 Best validation loss: {best_val_loss:.4f}")
     
-    # Final save
-    final_checkpoint_path = save_checkpoint(
-        model_engine, global_step, config['num_epochs'], train_loss, val_loss,
-        config, config['checkpoint_dir']
-    )
-    logger.info(f"💾 Saved final checkpoint: {final_checkpoint_path}")
+    # Save final best model if this is the best validation loss
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        if deepspeed.comm.get_rank() == 0:
+            try:
+                best_checkpoint_path = os.path.join(config['checkpoint_dir'], "best_model")
+                model_engine.save_checkpoint(best_checkpoint_path)
+                logger.info(f"🏆 Final training resulted in new best model (val_loss: {val_loss:.4f})")
+            except Exception as e:
+                logger.error(f"❌ Best model save failed: {e}")
+    
+    # Final save - use the same hybrid method that works during training
+    try:
+        logger.info("💾 Saving final checkpoint using hybrid method...")
+        final_checkpoint_path = save_checkpoint(
+            model_engine, global_step, config['num_epochs'], train_loss, val_loss,
+            config, config['checkpoint_dir']
+        )
+        if final_checkpoint_path:
+            logger.info(f"✅ Final checkpoint saved successfully: {final_checkpoint_path}")
+        else:
+            logger.warning("⚠️ Final checkpoint save returned None - may have failed")
+    except Exception as e:
+        logger.error(f"❌ Final checkpoint save failed: {e}")
+        logger.error(f"❌ Training completed but final save crashed - model state preserved in last periodic checkpoint")
+        import traceback
+        logger.error(f"❌ Final save traceback: {traceback.format_exc()}")
+    
+    # Cleanup old checkpoints after final saves
+    cleanup_old_checkpoints(config['checkpoint_dir'], config['keep_last_n_checkpoints'])
     
     # Cleanup wandb and distributed training
     if WANDB_AVAILABLE and wandb.run is not None and deepspeed.comm.get_rank() == 0:
