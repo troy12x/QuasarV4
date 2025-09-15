@@ -1,5 +1,5 @@
 {
-  "train_batch_size": 6,
+  "train_batch_size": 2,
   "train_micro_batch_size_per_gpu": 1,
   "gradient_accumulation_steps": 2,
   "zero_allow_untested_optimizer": true,
@@ -31,7 +31,7 @@
     }
   },
   "zero_optimization": {
-    "stage": 0,
+    "stage": 1,
     "allgather_partitions": true,
     "allgather_bucket_size": 2e8,
     "overlap_comm": true,
