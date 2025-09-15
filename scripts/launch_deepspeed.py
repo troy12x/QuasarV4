@@ -39,6 +39,8 @@ def main():
                        help='Enable mixed dataset training')
     parser.add_argument('--dataset_ratios', type=str, default='0.7,0.3',
                        help='Dataset mixing ratios (e.g., 0.7,0.3)')
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                       help='Path to checkpoint to resume from (e.g., checkpoints/best_model_step_84000)')
     
     args = parser.parse_args()
     
@@ -90,6 +92,23 @@ def main():
         cmd.extend(['--mix_dataset'])
         cmd.extend(['--dataset_ratios', args.dataset_ratios])
         print(f"🎯 Mixed dataset enabled with ratios: {args.dataset_ratios}")
+    
+    # Add checkpoint resumption if specified
+    if args.resume_from_checkpoint:
+        # Validate checkpoint exists
+        checkpoint_path = Path(args.resume_from_checkpoint)
+        print(f"🔍 DEBUG: Checking checkpoint path: {checkpoint_path}")
+        print(f"🔍 DEBUG: Absolute path: {checkpoint_path.absolute()}")
+        print(f"🔍 DEBUG: Path exists: {checkpoint_path.exists()}")
+        if checkpoint_path.exists():
+            print(f"🔍 DEBUG: Directory contents: {list(checkpoint_path.iterdir())}")
+        
+        if not checkpoint_path.exists():
+            print(f"❌ Error: Checkpoint not found: {checkpoint_path}")
+            print(f"❌ Absolute path checked: {checkpoint_path.absolute()}")
+            sys.exit(1)
+        cmd.extend(['--resume_from_checkpoint', args.resume_from_checkpoint])
+        print(f"🔄 Resuming from checkpoint: {args.resume_from_checkpoint}")
     
     print(f"💻 Command: {' '.join(cmd)}")
     print("🚀 Starting training...")
