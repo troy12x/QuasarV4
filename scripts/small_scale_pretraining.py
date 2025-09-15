@@ -120,7 +120,7 @@ class TrueEvolvingLanguageModel(nn.Module):
     - Infinite context without fixed limits
     """
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_layers=6, d_ff=2048, 
-                 max_seq_len=None, dropout=0.1):
+                max_seq_len=None, dropout=0.1):
         super().__init__()
         self.d_model = d_model
         # Hierarchical Flow Anchoring supports infinite context
@@ -390,10 +390,10 @@ class TextDataset(Dataset):
             batch_size = 1000  # Much smaller batches to prevent OOM
             
             pbar = tqdm(range(0, len(texts), batch_size), 
-                       desc="🔤 Tokenizing", 
-                       file=sys.stdout, 
-                       dynamic_ncols=True,
-                       miniters=1)
+                    desc="🔤 Tokenizing", 
+                    file=sys.stdout, 
+                    dynamic_ncols=True,
+                    miniters=1)
             
             for i in pbar:
                 batch_texts = texts[i:i + batch_size]
@@ -586,8 +586,8 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
         # Log progress to console (only rank 0 to avoid duplicate prints)
         if batch_idx % config.get('log_every', 1) == 0 and deepspeed.comm.get_rank() == 0:
             logger.info(f"Epoch {epoch}, Step {current_step}, Batch {batch_idx}/{num_batches}, "
-                       f"Loss: {loss.item():.4f} (smooth: {smoothed_loss:.4f}), LR: {lr:.6f}, GradNorm: {grad_norm:.4f}, "
-                       f"Tokens: {total_tokens:,}, Tokens/sec: {tokens_per_sec:.0f}")
+                    f"Loss: {loss.item():.4f} (smooth: {smoothed_loss:.4f}), LR: {lr:.6f}, GradNorm: {grad_norm:.4f}, "
+                    f"Tokens: {total_tokens:,}, Tokens/sec: {tokens_per_sec:.0f}")
         
         # Log to wandb at configured frequency (separate from console logging)
         if current_step % config['logging_steps'] == 0 and WANDB_AVAILABLE and wandb.run is not None and deepspeed.comm.get_rank() == 0:
@@ -613,7 +613,7 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
             
             # Save checkpoint
             checkpoint_result = save_checkpoint(model_engine, current_step, epoch, loss.item(), val_loss, 
-                          config, config['checkpoint_dir'])
+                        config, config['checkpoint_dir'])
             
             if checkpoint_result is None:
                 if deepspeed.comm.get_rank() == 0:
@@ -632,59 +632,58 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
                                                         batch_size=1
                                                     ), device)
             
+            # Log validation metrics to wandb
+            if WANDB_AVAILABLE and wandb.run is not None and deepspeed.comm.get_rank() == 0:
+                try:
+                    wandb.log({
+                        "val_loss": val_loss,
+                        "val_perplexity": val_perplexity,
+                        "best_val_loss": best_val_loss
+                    }, step=current_step)
+                except Exception as e:
+                    logger.warning(f"Wandb validation logging failed: {e}")
+            
             # Track best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_checkpoint_path = os.path.join(config['checkpoint_dir'], f"best_model_step_{current_step}")
                 
-                # Use our fast PyTorch checkpoint saving for best model
-                try:
-                    # Clean up any existing best model checkpoint
-                    if os.path.exists(best_checkpoint_path):
-                        import shutil
-                        shutil.rmtree(best_checkpoint_path)
+                # Use optimized DeepSpeed consolidated checkpointing for best model
+                if deepspeed.comm.get_rank() == 0:
+                    best_checkpoint_path = os.path.join(config['checkpoint_dir'], f"best_model_step_{current_step}")
                     
-                    # Create directory for best model checkpoint
-                    os.makedirs(best_checkpoint_path, exist_ok=True)
-                    
-                    # Get model, optimizer, scheduler states
-                    model_state = model_engine.module.state_dict() if hasattr(model_engine, 'module') else model_engine.state_dict()
-                    optimizer_state = model_engine.optimizer.state_dict() if hasattr(model_engine, 'optimizer') else None
-                    scheduler_state = model_engine.lr_scheduler.state_dict() if hasattr(model_engine, 'lr_scheduler') else None
-                    
-                    # Create checkpoint data
-                    checkpoint_data = {
-                        'model_state_dict': model_state,
-                        'optimizer_state_dict': optimizer_state,
-                        'scheduler_state_dict': scheduler_state,
-                        'step': current_step,
-                        'epoch': epoch,
-                        'val_loss': val_loss,
-                        'timestamp': time.time(),
-                        'is_best_model': True
-                    }
-                    
-                    # Save checkpoint file
-                    checkpoint_file = os.path.join(best_checkpoint_path, 'pytorch_model.bin')
-                    torch.save(checkpoint_data, checkpoint_file)
-                    
-                    # Save metadata
-                    metadata = {
-                        'step': current_step,
-                        'epoch': epoch,
-                        'val_loss': val_loss,
-                        'timestamp': time.time(),
-                        'checkpoint_type': 'best_model_pytorch',
-                        'is_best_model': True
-                    }
-                    metadata_path = os.path.join(best_checkpoint_path, 'metadata.json')
-                    with open(metadata_path, 'w') as f:
-                        json.dump(metadata, f, indent=2)
-                    
-                    logger.info(f"🏆 New best model saved at step {current_step} (val_loss: {val_loss:.4f})")
-                except (OSError, RuntimeError) as e:
-                    logger.warning(f"❌ Failed to save best model checkpoint: {e}")
-                    logger.info(f"🏆 Best validation loss updated to {val_loss:.4f} at step {current_step} (checkpoint save failed)")
+                    try:
+                        # Use the same DeepSpeed checkpoint saving as regular checkpoints
+                        save_checkpoint(
+                            model_engine=model_engine,
+                            step=current_step,
+                            epoch=epoch,
+                            train_loss=0.0,  # Not available in validation context
+                            val_loss=val_loss,
+                            config=config,
+                            checkpoint_dir=best_checkpoint_path
+                        )
+                        
+                        # Save additional metadata for easy loading
+                        metadata = {
+                            'step': current_step,
+                            'epoch': epoch,
+                            'val_loss': val_loss,
+                            'timestamp': time.time(),
+                            'checkpoint_type': 'best_model_deepspeed_consolidated',
+                            'is_best_model': True,
+                            'tag': f"best_step_{current_step}"
+                        }
+                        metadata_path = os.path.join(best_checkpoint_path, 'best_model_metadata.json')
+                        with open(metadata_path, 'w') as f:
+                            json.dump(metadata, f, indent=2)
+                        
+                        logger.info(f"🏆 New best model saved at step {current_step} (val_loss: {val_loss:.4f}) using consolidated DeepSpeed checkpoint")
+                    except Exception as e:
+                        logger.warning(f"❌ Failed to save best model checkpoint: {e}")
+                        logger.info(f"🏆 Best validation loss updated to {val_loss:.4f} at step {current_step} (checkpoint save failed)")
+                else:
+                    # Non-rank 0 processes just log the improvement
+                    logger.info(f"🏆 Best validation loss updated to {val_loss:.4f} at step {current_step}")
     
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
@@ -692,7 +691,7 @@ def train_epoch(model_engine, dataloader, device, epoch, config, global_step=0):
     
     logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
     logger.info(f"📊 Epoch Stats: {total_tokens:,} tokens processed in {epoch_time:.1f}s ({final_tokens_per_sec:.0f} tokens/sec)")
-    return avg_loss, total_tokens, current_step
+    return avg_loss, total_tokens, current_step, best_val_loss
 
 def evaluate_model(model_engine, dataloader, device):
     """Evaluate model on validation set with DeepSpeed"""
@@ -725,129 +724,65 @@ def evaluate_model(model_engine, dataloader, device):
     return avg_loss, perplexity
 
 def save_checkpoint(model_engine, step, epoch, train_loss, val_loss, config, checkpoint_dir):
-    """Fast hybrid checkpoint saving - PyTorch for speed, DeepSpeed compatibility"""
-    if deepspeed.comm.get_rank() == 0:
-        # Create checkpoint directory
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(checkpoint_dir, f"step_{step}")
+    """DeepSpeed consolidated checkpoint saving - optimized for performance"""
+    # Create checkpoint directory
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"step_{step}")
+    
+    try:
+        logger.info(f"💾 Saving DeepSpeed consolidated checkpoint: {checkpoint_path}")
+        start_time = time.time()
         
-        try:
-            logger.info(f"💾 Saving fast hybrid checkpoint: {checkpoint_path}")
-            start_time = time.time()
-            
-            # Clean up any partial checkpoint
-            if os.path.exists(checkpoint_path):
-                import shutil
-                shutil.rmtree(checkpoint_path)
-                logger.info(f"🧹 Cleaned up partial checkpoint: {checkpoint_path}")
-            
-            # Create checkpoint directory
-            os.makedirs(checkpoint_path, exist_ok=True)
-            
-            # Get model state dict efficiently
-            logger.info(f"🔄 Extracting model state...")
-            if hasattr(model_engine, 'module'):
-                model_state = model_engine.module.state_dict()
-            else:
-                model_state = model_engine.state_dict()
-            
-            # Get optimizer state (only if available and not too large)
-            optimizer_state = None
-            scheduler_state = None
-            
-            try:
-                if hasattr(model_engine, 'optimizer') and model_engine.optimizer is not None:
-                    optimizer_state = model_engine.optimizer.state_dict()
-                    logger.info(f"✅ Extracted optimizer state")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not extract optimizer state: {e}")
-            
-            try:
-                if hasattr(model_engine, 'lr_scheduler') and model_engine.lr_scheduler is not None:
-                    scheduler_state = model_engine.lr_scheduler.state_dict()
-                    logger.info(f"✅ Extracted scheduler state")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not extract scheduler state: {e}")
-            
-            # Create checkpoint data
-            checkpoint_data = {
-                'model_state_dict': model_state,
-                'optimizer_state_dict': optimizer_state,
-                'scheduler_state_dict': scheduler_state,
+        # Use DeepSpeed's consolidated checkpoint saving
+        model_engine.save_checkpoint(
+            save_dir=checkpoint_path,
+            tag=f"step_{step}",
+            client_state={
                 'step': step,
                 'epoch': epoch,
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'timestamp': time.time(),
-                'checkpoint_type': 'hybrid_fast'
-            }
-            
-            # Save model state with atomic write
-            logger.info(f"💾 Writing checkpoint file...")
-            checkpoint_file = os.path.join(checkpoint_path, 'pytorch_model.bin')
-            temp_file = checkpoint_file + '.tmp'
-            
-            # Write to temporary file first
-            torch.save(checkpoint_data, temp_file)
-            
-            # Validate temporary file
-            temp_size = os.path.getsize(temp_file)
-            temp_size_mb = temp_size / (1024 * 1024)
-            
-            if temp_size == 0:
-                raise RuntimeError(f"Temporary checkpoint file is empty: {temp_file}")
-            
-            # Test load temporary file
-            try:
-                test_data = torch.load(temp_file, map_location='cpu')
-                del test_data  # Free memory
-                logger.info(f"✅ Checkpoint validation passed - {temp_size_mb:.1f} MB")
-            except Exception as e:
-                raise RuntimeError(f"Checkpoint validation failed: {e}")
-            
-            # Atomic move to final location
-            import shutil
-            shutil.move(temp_file, checkpoint_file)
-            
-            save_time = time.time() - start_time
-            logger.info(f"✅ Fast checkpoint saved in {save_time:.1f} seconds")
-            
-            # Save metadata
+                'checkpoint_type': 'deepspeed_consolidated'
+            },
+            save_latest=False,
+            exclude_frozen_parameters=False
+        )
+        
+        # Save additional metadata for compatibility
+        if deepspeed.comm.get_rank() == 0:
             metadata = {
                 'step': step,
                 'epoch': epoch,
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'timestamp': time.time(),
-                'save_duration': save_time,
-                'checkpoint_type': 'hybrid_fast',
-                'file_size_mb': temp_size_mb
+                'checkpoint_type': 'deepspeed_consolidated',
+                'tag': f"step_{step}"
             }
-            
             metadata_path = os.path.join(checkpoint_path, 'metadata.json')
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
-            
-            logger.info(f"✅ Successfully saved checkpoint: {checkpoint_path}")
-            return checkpoint_path
+        
+        save_time = time.time() - start_time
+        logger.info(f"✅ DeepSpeed consolidated checkpoint saved in {save_time:.1f} seconds")
+        logger.info(f"✅ Successfully saved checkpoint: {checkpoint_path}")
+        return checkpoint_path
                 
-        except Exception as e:
-            logger.error(f"💥 Checkpoint save failed: {e}")
-            import traceback
-            logger.error(f"💥 Traceback: {traceback.format_exc()}")
-            
-            # Clean up partial checkpoint
-            if os.path.exists(checkpoint_path):
-                try:
-                    import shutil
-                    shutil.rmtree(checkpoint_path)
-                    logger.info(f"🧹 Cleaned up failed checkpoint: {checkpoint_path}")
-                except:
-                    pass
-            return None
-    
-    # Non-rank 0 processes just wait
-    return None
+    except Exception as e:
+        logger.error(f"💥 Checkpoint save failed: {e}")
+        import traceback
+        logger.error(f"💥 Traceback: {traceback.format_exc()}")
+        
+        # Clean up partial checkpoint on failure
+        if os.path.exists(checkpoint_path):
+            try:
+                import shutil
+                shutil.rmtree(checkpoint_path)
+                logger.info(f"🧹 Cleaned up failed checkpoint: {checkpoint_path}")
+            except:
+                pass
+        return None
 
 def load_checkpoint(model_engine, checkpoint_path):
     """Load DeepSpeed checkpoint with fallback to PyTorch"""
@@ -1038,9 +973,9 @@ def main():
     parser.add_argument('--deepspeed_config', type=str, default='scripts/ds_config.json')
     parser.add_argument('--mix_dataset', action='store_true', help='Enable mixed dataset training')
     parser.add_argument('--dataset_ratios', type=str, default='0.7,0.3', 
-                       help='Comma-separated ratios for mixed datasets (e.g., 0.7,0.3)')
+                    help='Comma-separated ratios for mixed datasets (e.g., 0.7,0.3)')
     parser.add_argument('--resume_from_checkpoint', type=str, default=None,
-                       help='Path to checkpoint to resume from (e.g., checkpoints/best_model_step_84000)')
+                    help='Path to checkpoint to resume from (e.g., checkpoints/best_model_step_84000)')
     args = parser.parse_args()
     
     # Configuration for multi-GPU training with DeepSpeed - 4B Parameter Model
@@ -1050,15 +985,15 @@ def main():
         'n_heads': 8,         # 32 dims per head (256/8)
         'n_layers': 6,        # Scaled down for 20M parameters
         'd_ff': 1024,         # 4x d_model (standard ratio)
-        'max_seq_len': 2048,   # Keep sequence length manageable
+        'max_seq_len': 715,   # Keep sequence length manageable
         'dropout': 0.1,
         'batch_size': 4,      # Per-GPU batch size (DeepSpeed handles global batching)
         'learning_rate': 1e-4,
         'num_epochs': 1,
         'warmup_steps': 100,
         'weight_decay': 0.01,
-        'save_every': 5000,    # Save checkpoint every N steps
-        'eval_every': 1000,     # Evaluate every N steps  
+        'save_every': 10,    # Save checkpoint every N steps
+        'eval_every': 10,     # Evaluate every N steps  
         'val_split': 0.1,
         'logging_steps': 1000,   # Log every step to wandb
         'log_every': 2,       # Log every step to console
@@ -1205,30 +1140,9 @@ def main():
         logger.info(f"📁 Checkpoint path: {args.resume_from_checkpoint}")
         logger.info(f"📂 Path exists: {os.path.exists(args.resume_from_checkpoint)}")
         
-        if os.path.exists(args.resume_from_checkpoint):
-            logger.info(f"📁 CHECKPOINT DEBUG: Directory contents: {os.listdir(args.resume_from_checkpoint)}")
         else:
-            logger.error(f"❌ CHECKPOINT PATH NOT FOUND: {args.resume_from_checkpoint}")
-            logger.error(f"❌ Current working directory: {os.getcwd()}")
-            logger.error(f"❌ Absolute path would be: {os.path.abspath(args.resume_from_checkpoint)}")
-        
-        logger.info(f"🚀 CALLING load_checkpoint function...")
-        checkpoint_metadata = load_checkpoint(model_engine, args.resume_from_checkpoint)
-        logger.info(f"🔙 RETURNED from load_checkpoint, result: {checkpoint_metadata}")
-        
-        if checkpoint_metadata:
-            start_epoch = checkpoint_metadata.get('epoch', 0)
-            global_step = checkpoint_metadata.get('step', 0)
-            logger.info(f"✅ CHECKPOINT SUCCESS: Resumed from step {global_step}, epoch {start_epoch}")
-            logger.info(f"📊 CHECKPOINT METADATA: {checkpoint_metadata}")
-        else:
-            logger.error(f"❌ CHECKPOINT FAILED: Could not load from {args.resume_from_checkpoint}")
-            logger.info("🆕 STARTING FROM SCRATCH: Creating new model...")
-            logger.error(f"❌ Failed to load checkpoint from {args.resume_from_checkpoint}")
-            logger.error(f"❌ Starting training from scratch...")
-            logger.error("=" * 60)
-    else:
-        logger.info("🆕 No checkpoint specified - starting fresh training")
+            logger.warning(f"⚠️ Checkpoint path does not exist: {checkpoint_path}")
+            logger.info("🆕 Starting fresh training")
     
     logger.info(f"🚀 Training will start from epoch {start_epoch}, step {global_step}")
     logger.info(f"📊 Total steps planned: {total_steps:,}")
@@ -1245,8 +1159,8 @@ def main():
         if remaining_steps > 0:
             # Continue training from current step
             logger.info(f"▶️  Continuing epoch {start_epoch + 1} from step {global_step}")
-            train_loss, epoch_tokens, global_step = train_epoch(
-                model_engine, train_dataloader, device, start_epoch + 1, config, global_step
+            train_loss, epoch_tokens, global_step, best_val_loss = train_epoch(
+                model_engine, train_dataloader, device, start_epoch + 1, config, global_step, best_val_loss
             )
             cumulative_tokens += epoch_tokens
             
@@ -1263,8 +1177,8 @@ def main():
             logger.info(f"Starting epoch {epoch + 1}/{config['num_epochs']}")
             
             # Train with checkpointing
-            train_loss, epoch_tokens, global_step = train_epoch(
-                model_engine, train_dataloader, device, epoch + 1, config, global_step
+            train_loss, epoch_tokens, global_step, best_val_loss = train_epoch(
+                model_engine, train_dataloader, device, epoch + 1, config, global_step, best_val_loss
             )
             cumulative_tokens += epoch_tokens
             
@@ -1303,7 +1217,15 @@ def main():
             best_val_loss = val_loss
             if deepspeed.comm.get_rank() == 0:
                 best_checkpoint_path = os.path.join(config['checkpoint_dir'], "best_model")
-                model_engine.save_checkpoint(best_checkpoint_path)
+                save_checkpoint(
+                    model_engine=model_engine,
+                    step=global_step,
+                    epoch=config['num_epochs'],
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    config=config,
+                    checkpoint_dir=best_checkpoint_path
+                )
                 logger.info(f"🏆 New best model saved (val_loss: {val_loss:.4f})")
         
         # Cleanup old checkpoints
@@ -1320,7 +1242,15 @@ def main():
         if deepspeed.comm.get_rank() == 0:
             try:
                 best_checkpoint_path = os.path.join(config['checkpoint_dir'], "best_model")
-                model_engine.save_checkpoint(best_checkpoint_path)
+                save_checkpoint(
+                    model_engine=model_engine,
+                    step=global_step,
+                    epoch=config['num_epochs'],
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    config=config,
+                    checkpoint_dir=best_checkpoint_path
+                )
                 logger.info(f"🏆 Final training resulted in new best model (val_loss: {val_loss:.4f})")
             except Exception as e:
                 logger.error(f"❌ Best model save failed: {e}")
